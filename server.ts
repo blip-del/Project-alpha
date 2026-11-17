@@ -148,6 +148,9 @@ function generateFallbackOptionChain(ticker: string, targetDateTimestamp?: numbe
     AMD: { price: 156.30, name: "Advanced Micro Devices, Inc.", iv: 0.41 },
     AMZN: { price: 188.50, name: "Amazon.com, Inc.", iv: 0.28 },
     META: { price: 520.10, name: "Meta Platforms, Inc.", iv: 0.33 },
+    ASML: { price: 785.40, name: "ASML Holding N.V.", iv: 0.31 },
+    SAP: { price: 198.60, name: "SAP SE", iv: 0.20 },
+    QQQ: { price: 485.20, name: "Invesco QQQ Trust", iv: 0.18 },
   };
 
   const info = basePrices[symbol] || {
@@ -425,6 +428,72 @@ async function fetchYahooOptionsChain(ticker: string, dateTimestamp?: number) {
   }
 }
 
+// Live spot quote fetcher using Yahoo Chart v8 API (supports stocks, European tickers .PA/.MI/.AS, and FX pairs like EURUSD=X)
+async function fetchYahooSpotQuote(ticker: string): Promise<any | null> {
+  const cleanTicker = ticker.trim().toUpperCase();
+  const cacheKey = `spot_${cleanTicker}`;
+  const cached = optionsCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6000);
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(cleanTicker)}?interval=1d&range=5d`;
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": userAgent, Accept: "application/json" },
+    });
+    clearTimeout(timeoutId);
+
+    if (res.ok) {
+      const json: any = await res.json();
+      const meta = json?.chart?.result?.[0]?.meta;
+      if (meta && typeof meta.regularMarketPrice === "number" && meta.regularMarketPrice > 0) {
+        const price = meta.regularMarketPrice;
+        const prevClose = meta.chartPreviousClose || meta.previousClose || price;
+        const change = price - prevClose;
+        const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
+        const quote = {
+          symbol: meta.symbol || cleanTicker,
+          shortName: meta.shortName || meta.longName || cleanTicker,
+          regularMarketPrice: price,
+          regularMarketChange: Number(change.toFixed(4)),
+          regularMarketChangePercent: Number(changePct.toFixed(2)),
+          regularMarketDayHigh: meta.regularMarketDayHigh || price,
+          regularMarketDayLow: meta.regularMarketDayLow || price,
+          regularMarketVolume: meta.regularMarketVolume || 0,
+          fiftyTwoWeekHigh: meta.fiftyTwoWeekHigh || price,
+          fiftyTwoWeekLow: meta.fiftyTwoWeekLow || price,
+          marketCap: 0,
+          exchange: meta.exchangeName || meta.fullExchangeName || "",
+          currency: meta.currency || "USD",
+        };
+        optionsCache.set(cacheKey, { timestamp: Date.now(), data: quote });
+        return quote;
+      }
+    }
+  } catch (err) {
+    console.warn(`Yahoo chart quote failed for ${cleanTicker}:`, err);
+  }
+
+  // Fallback to live Yahoo options quote (strictly ignoring synthetic mock fallback)
+  try {
+    const optData = await fetchYahooOptionsChain(cleanTicker);
+    if (optData && !optData.isFallback && optData.quote?.regularMarketPrice > 0) {
+      optionsCache.set(cacheKey, { timestamp: Date.now(), data: optData.quote });
+      return optData.quote;
+    }
+  } catch {
+    // Ignore
+  }
+
+  return null;
+}
+
 // ----------------------------------------------------
 // API ROUTES
 // ----------------------------------------------------
@@ -432,6 +501,36 @@ async function fetchYahooOptionsChain(ticker: string, dateTimestamp?: number) {
 // Health check
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// Multi-ticker Portfolio Quotes endpoint (live quotes only — never injects synthetic $150 fallbacks)
+app.get("/api/portfolio-quotes", async (req, res) => {
+  try {
+    const rawSymbols = String(req.query.symbols || "").trim();
+    if (!rawSymbols) {
+      return res.json({ quotes: {} });
+    }
+    const symbols = Array.from(new Set(rawSymbols.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean)));
+    const quotes: Record<string, any> = {};
+
+    await Promise.all(
+      symbols.map(async (sym) => {
+        try {
+          const quote = await fetchYahooSpotQuote(sym);
+          if (quote && quote.regularMarketPrice > 0) {
+            quotes[sym] = quote;
+          }
+        } catch (e) {
+          console.warn(`Portfolio quote failed for ${sym}:`, e);
+        }
+      })
+    );
+
+    return res.json({ quotes });
+  } catch (error: any) {
+    console.error("API error in /api/portfolio-quotes:", error);
+    return res.status(500).json({ error: error.message || "Failed to fetch quotes" });
+  }
 });
 
 // Options Chain endpoint

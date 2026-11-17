@@ -1,155 +1,161 @@
-import React from "react";
-import { StockQuote } from "../types";
-import { Star, RefreshCw, Code2, ShieldAlert, Zap, TrendingUp, TrendingDown } from "lucide-react";
+import React from 'react';
+import {
+  TrendingUp,
+  RefreshCw,
+  Download,
+  Upload,
+  Database,
+  ShieldCheck,
+  Globe,
+  SlidersHorizontal,
+  ChevronRight,
+  Sparkles,
+} from 'lucide-react';
+import { StockQuote, StockPosition, PositionMark } from '../types';
 
 interface HeaderProps {
-  quote: StockQuote;
-  atmIv: number;
-  ivRank?: number;
-  hv30?: number;
-  dte: number;
-  isFallback?: boolean;
-  isLoading: boolean;
-  onRefresh: () => void;
-  onOpenStreamlitCode: () => void;
-  isFavorite: boolean;
-  onToggleFavorite: () => void;
+  baseCurrency: 'EUR' | 'USD';
+  onToggleCurrency: () => void;
+  onRefreshQuotes: () => void;
+  isRefreshing: boolean;
+  onLoadDemo: () => void;
+  onOpenImport: () => void;
+  onExportJson: () => void;
+  quotes: Record<string, StockQuote>;
+  tapeTickers?: string[];
+  positions?: StockPosition[];
+  positionMarks?: Record<string, PositionMark>;
 }
 
 export const Header: React.FC<HeaderProps> = ({
-  quote,
-  atmIv,
-  ivRank = 28,
-  hv30 = 34.5,
-  isFallback,
-  isLoading,
-  onRefresh,
-  onOpenStreamlitCode,
-  isFavorite,
-  onToggleFavorite,
+  baseCurrency,
+  onToggleCurrency,
+  onRefreshQuotes,
+  isRefreshing,
+  onLoadDemo,
+  onOpenImport,
+  onExportJson,
+  quotes,
+  tapeTickers = [],
+  positions = [],
+  positionMarks = {},
 }) => {
-  const isPositive = quote.regularMarketChange >= 0;
+  const displayTickers = tapeTickers.length > 0 ? tapeTickers : Object.keys(quotes).slice(0, 6);
 
   return (
-    <header className="border-b border-[#172334] bg-[#090e17]/95 backdrop-blur px-4 py-2.5 sticky top-0 z-40">
-      <div className="max-w-[1750px] mx-auto flex flex-wrap items-center justify-between gap-3">
-        {/* Left: Brand + Ticker info */}
+    <header className="border-b border-[#1c2838] bg-[#090f18]/90 backdrop-blur sticky top-0 z-40">
+      {/* Top Banner */}
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-wrap items-center justify-between gap-4">
+        {/* Brand & Subtitle */}
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
-            <span className="flex h-7 w-7 items-center justify-center rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 font-black text-xs">
-              Ω
-            </span>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-lg font-extrabold text-white tracking-tight flex items-center gap-1.5 font-mono">
-                  {quote.symbol}
-                  <button
-                    onClick={onToggleFavorite}
-                    className={`p-1 hover:text-amber-400 transition-colors ${
-                      isFavorite ? "text-amber-400 fill-amber-400" : "text-slate-500"
-                    }`}
-                    title="Toggle Favorite"
-                  >
-                    <Star className="w-3.5 h-3.5" fill={isFavorite ? "currentColor" : "none"} />
-                  </button>
-                </h1>
-                <span className="text-xs text-slate-400 max-w-[160px] truncate hidden sm:inline">
-                  {quote.shortName}
-                </span>
-                <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">
-                  {quote.exchange || "US"}
-                </span>
-              </div>
-            </div>
+          <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-emerald-500/20 to-cyan-500/10 border border-emerald-500/40 flex items-center justify-center text-emerald-400 shadow-sm shadow-emerald-500/10">
+            <TrendingUp className="w-5 h-5" />
           </div>
-
-          <div className="h-6 w-[1px] bg-slate-800 hidden md:block" />
-
-          {/* Current Price & Change */}
-          <div className="flex items-baseline gap-2">
-            <span className="text-2xl font-black font-mono text-white tracking-tight">
-              ${quote.regularMarketPrice.toFixed(2)}
-            </span>
-            <div
-              className={`flex items-center gap-0.5 text-xs font-mono font-bold px-1.5 py-0.5 rounded ${
-                isPositive
-                  ? "text-emerald-400 bg-emerald-500/10"
-                  : "text-rose-400 bg-rose-500/10"
-              }`}
-            >
-              {isPositive ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
-              <span>
-                {isPositive ? "+" : ""}
-                {quote.regularMarketChange.toFixed(2)} ({isPositive ? "+" : ""}
-                {quote.regularMarketChangePercent.toFixed(2)}%)
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="font-bold text-white text-base tracking-tight font-sans">
+                APEX <span className="text-emerald-400 font-mono">//</span> CHRONO-TRACKER
+              </span>
+              <span className="text-[10px] font-mono font-semibold px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                REAL BASIS ENGINE
               </span>
             </div>
+            <p className="text-xs text-slate-400 font-mono hidden sm:block">
+              Interactive Brokers Flex XML / CSV &amp; Two-Bucket Cost Pool Engine
+            </p>
           </div>
         </div>
 
-        {/* Center: ApexVol Metrics Bar */}
-        <div className="hidden lg:flex items-center gap-4 bg-[#0d1624] border border-[#1a283c] px-3 py-1.5 rounded-lg text-xs font-mono">
-          <div className="flex flex-col">
-            <span className="text-[10px] text-slate-400 font-sans uppercase tracking-wider">IV Rank (1y)</span>
-            <span className="text-emerald-400 font-bold">{ivRank}%ile</span>
-          </div>
-          <div className="h-5 w-[1px] bg-slate-800" />
-          <div className="flex flex-col">
-            <span className="text-[10px] text-slate-400 font-sans uppercase tracking-wider">ATM IV (30d)</span>
-            <span className="text-white font-bold">{atmIv.toFixed(1)}%</span>
-          </div>
-          <div className="h-5 w-[1px] bg-slate-800" />
-          <div className="flex flex-col">
-            <span className="text-[10px] text-slate-400 font-sans uppercase tracking-wider">HV 30D</span>
-            <span className="text-slate-300 font-bold">{hv30.toFixed(1)}%</span>
-          </div>
-          <div className="h-5 w-[1px] bg-slate-800" />
-          <div className="flex flex-col">
-            <span className="text-[10px] text-slate-400 font-sans uppercase tracking-wider">Market</span>
-            <span className="text-emerald-400 font-bold flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              LIVE
-            </span>
-          </div>
+        {/* Action Controls & Currency Toggle */}
+        <div className="flex items-center flex-wrap gap-2">
+          {/* Base Currency Toggle */}
+          <button
+            onClick={onToggleCurrency}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#0d1624] hover:bg-[#121f33] border border-[#1e2f44] text-xs font-mono text-slate-300 transition-colors"
+            title="Toggle Base Reporting Currency (EUR / USD)"
+          >
+            <Globe className="w-3.5 h-3.5 text-cyan-400" />
+            <span className="text-slate-400">Base:</span>
+            <span className="text-emerald-400 font-bold">{baseCurrency}</span>
+          </button>
+
+          {/* Refresh Quotes */}
+          <button
+            onClick={onRefreshQuotes}
+            disabled={isRefreshing}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#0d1624] hover:bg-[#121f33] border border-[#1e2f44] text-xs font-mono text-slate-300 transition-colors disabled:opacity-50"
+            title="Fetch real-time spot quotes from live financial data feed"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 text-emerald-400 ${isRefreshing ? 'animate-spin' : ''}`} />
+            <span className="hidden sm:inline">Refresh</span>
+          </button>
+
+          {/* Load Demo Portfolio */}
+          <button
+            onClick={onLoadDemo}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 text-xs font-mono text-emerald-300 transition-colors"
+            title="Load realistic multi-year sample IBKR portfolio"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Load Demo</span>
+          </button>
+
+          {/* Import CSV/XML */}
+          <button
+            onClick={onOpenImport}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#132236] hover:bg-[#1a2e47] border border-[#233a59] text-xs font-mono text-slate-200 transition-colors"
+            title="Import IBKR Flex XML, Activity CSV, or JSON"
+          >
+            <Upload className="w-3.5 h-3.5 text-cyan-400" />
+            <span>Import IBKR</span>
+          </button>
+
+          {/* Export JSON */}
+          <button
+            onClick={onExportJson}
+            className="p-1.5 rounded-md bg-[#0d1624] hover:bg-[#121f33] border border-[#1e2f44] text-slate-400 hover:text-slate-200 transition-colors"
+            title="Export JSON Backup"
+          >
+            <Download className="w-4 h-4" />
+          </button>
         </div>
+      </div>
 
-        {/* Right: Actions */}
-        <div className="flex items-center gap-2">
-          {isFallback ? (
-            <span
-              className="flex items-center gap-1.5 text-[11px] font-mono text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2.5 py-1 rounded-md"
-              title="Calculated Black-Scholes synthetic chain used as fallback"
-            >
-              <ShieldAlert className="w-3.5 h-3.5" />
-              <span>Simulated Feed</span>
-            </span>
-          ) : (
-            <span
-              className="flex items-center gap-1.5 text-[11px] font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-2.5 py-1 rounded-md"
-              title="Real-time live options chain from Yahoo Finance"
-            >
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="font-bold">Real Yahoo Data</span>
-            </span>
-          )}
+      {/* Mini Ticker-Tape Bar */}
+      <div className="bg-[#060a10] border-t border-[#131d2b] px-4 sm:px-6 py-1.5 overflow-x-auto text-[11px] font-mono flex items-center gap-5 text-slate-400">
+        <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider flex items-center gap-1.5 shrink-0">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+          SPOT FEED
+        </span>
+        <div className="flex items-center gap-6 shrink-0">
+          {displayTickers.map((sym) => {
+            const pos = positions.find((p) => p.ticker === sym);
+            const mark = positionMarks[sym];
+            const q = quotes[sym];
+            const cur = pos?.currency || mark?.currency || 'USD';
+            const curSym = cur === 'EUR' ? '€' : '$';
+            const price = pos?.spotPrice || q?.regularMarketPrice || mark?.markPrice || 0;
+            const change = pos ? pos.spotChange : q?.regularMarketChange || 0;
+            const changePct = pos ? pos.spotChangePct : q?.regularMarketChangePercent || 0;
+            const isPos = change >= 0;
 
-          <button
-            onClick={onRefresh}
-            disabled={isLoading}
-            className="p-1.5 rounded bg-[#0f1a2a] hover:bg-[#16253b] text-slate-300 hover:text-white border border-[#1e2f46] transition-all disabled:opacity-50"
-            title="Refresh Live Data"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? "animate-spin text-emerald-400" : ""}`} />
-          </button>
-
-          <button
-            onClick={onOpenStreamlitCode}
-            className="flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded bg-gradient-to-r from-emerald-600/90 to-teal-600/90 hover:from-emerald-500 hover:to-teal-500 text-slate-950 font-mono shadow-sm transition-all"
-            title="View ready-to-run Streamlit Python app.py"
-          >
-            <Code2 className="w-3.5 h-3.5 stroke-[2.5]" />
-            <span>Python Streamlit App</span>
-          </button>
+            return (
+              <div key={sym} className="flex items-center gap-1.5">
+                <span className="font-bold text-slate-200">{sym}</span>
+                <span className="text-slate-300">
+                  {price > 0 ? `${curSym}${price.toFixed(price < 2 ? 3 : 2)}` : '—'}
+                </span>
+                {price > 0 && (
+                  <span className={`text-[10px] ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {isPos ? '+' : ''}{changePct.toFixed(2)}%
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <div className="ml-auto text-[10px] text-slate-500 hidden md:block">
+          Offline IBKR Statement Parser • Real-Time Basis Deduction
         </div>
       </div>
     </header>
