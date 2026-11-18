@@ -1,6 +1,6 @@
 /**
- * Interactive Brokers (IBKR) Multi-Section Activity Statement CSV Parser
- * Offline-capable client-side parser, deduplication engine, and demo portfolio generator.
+ * Interactive Brokers (IBKR) Multi-Section Activity Statement & Flex XML Parser
+ * Offline-capable client-side parser and SHA-like deduplication engine.
  */
 
 import { Transaction, AssetCategory, TradeAction, BucketType, OptionDetails, PositionMark } from '../types';
@@ -578,712 +578,6 @@ export function parseIBKRActivityCSV(
   };
 }
 
-/**
- * Generate rich, realistic multi-year demo portfolio transactions
- * covering NVDA, AAPL, TSLA, SPY, ASML with buys, partial sales,
- * splits, covered call rolls, net dividends, and standalone long calls.
- */
-export function getDemoPortfolioTransactions(): Transaction[] {
-  const demoList: Transaction[] = [];
-
-  const addTx = (t: Omit<Transaction, 'id' | 'defaultBucket' | 'bucket'> & { bucket?: BucketType }) => {
-    const isOption = t.assetCategory === 'OPT';
-    const defaultBucket: BucketType = t.bucket || (!isOption
-      ? 'LINKED'
-      : t.action === 'SELL'
-      ? 'LINKED'
-      : 'STANDALONE');
-    const id = generateTransactionHash(t.dateTime, t.symbol, t.quantity, t.price, t.tradeId);
-    demoList.push({
-      ...t,
-      id,
-      defaultBucket,
-      bucket: t.bucket || defaultBucket,
-    });
-  };
-
-  // -------------------------------------------------------------
-  // NVDA: Core Growth + Covered Call Roll Campaign + 10:1 Split
-  // -------------------------------------------------------------
-  // 1. Initial pre-split stock buys
-  addTx({
-    dateTime: '2023-01-20 14:30:00',
-    date: '2023-01-20',
-    section: 'Trades',
-    assetCategory: 'STK',
-    symbol: 'NVDA',
-    underlying: 'NVDA',
-    action: 'BUY',
-    quantity: 50,
-    price: 178.00,
-    proceeds: -8900.00,
-    commission: -1.05,
-    netCashFlow: -8901.05,
-    currency: 'USD',
-    fxRateToBase: 0.92,
-    tradeId: 'NVDA-BUY-1',
-    notes: 'Initial lot: 50 shares @ $178.00',
-  });
-
-  addTx({
-    dateTime: '2023-05-12 15:10:00',
-    date: '2023-05-12',
-    section: 'Trades',
-    assetCategory: 'STK',
-    symbol: 'NVDA',
-    underlying: 'NVDA',
-    action: 'BUY',
-    quantity: 50,
-    price: 285.00,
-    proceeds: -14250.00,
-    commission: -1.10,
-    netCashFlow: -14251.10,
-    currency: 'USD',
-    fxRateToBase: 0.91,
-    tradeId: 'NVDA-BUY-2',
-    notes: 'Second accumulation lot: 50 shares @ $285.00 (Total 100 shares)',
-  });
-
-  // 2. First Covered Call: Sold 1x Aug 18 '23 $460 Call
-  addTx({
-    dateTime: '2023-07-14 16:05:00',
-    date: '2023-07-14',
-    section: 'Trades',
-    assetCategory: 'OPT',
-    symbol: 'NVDA  230818C00460000',
-    underlying: 'NVDA',
-    action: 'SELL',
-    quantity: -1,
-    price: 12.50,
-    proceeds: 1250.00,
-    commission: -1.30,
-    netCashFlow: 1248.70,
-    currency: 'USD',
-    fxRateToBase: 0.89,
-    tradeId: 'NVDA-OPT-1',
-    notes: 'Covered Call Sell to Open (Credit +$1,250)',
-    optionDetails: { type: 'CALL', strike: 460, expiry: '2023-08-18', isShort: true },
-    bucket: 'LINKED',
-  });
-
-  // 3. CC expired OTM (stock was ~$432 on Aug 18)
-  // 4. Second Covered Call: Sold 1x Oct 20 '23 $480 Call
-  addTx({
-    dateTime: '2023-09-15 14:40:00',
-    date: '2023-09-15',
-    section: 'Trades',
-    assetCategory: 'OPT',
-    symbol: 'NVDA  231020C00480000',
-    underlying: 'NVDA',
-    action: 'SELL',
-    quantity: -1,
-    price: 14.20,
-    proceeds: 1420.00,
-    commission: -1.30,
-    netCashFlow: 1418.70,
-    currency: 'USD',
-    fxRateToBase: 0.94,
-    tradeId: 'NVDA-OPT-2A',
-    notes: 'Covered Call Sell to Open (Credit +$1,420)',
-    optionDetails: { type: 'CALL', strike: 480, expiry: '2023-10-20', isShort: true },
-    bucket: 'LINKED',
-  });
-
-  // 5. Early Exit / Roll: Buy to close Oct 20 Call for $3.20 (capturing 77% max profit)
-  addTx({
-    dateTime: '2023-10-12 11:25:00',
-    date: '2023-10-12',
-    section: 'Trades',
-    assetCategory: 'OPT',
-    symbol: 'NVDA  231020C00480000',
-    underlying: 'NVDA',
-    action: 'BUY',
-    quantity: 1,
-    price: 3.20,
-    proceeds: -320.00,
-    commission: -1.25,
-    netCashFlow: -321.25,
-    currency: 'USD',
-    fxRateToBase: 0.95,
-    tradeId: 'NVDA-OPT-2B',
-    notes: 'Early Exit: Buy to Close at 77% profit (-$320 debit)',
-    optionDetails: { type: 'CALL', strike: 480, expiry: '2023-10-20', isShort: false },
-    bucket: 'LINKED',
-  });
-
-  // 6. Quarterly Dividends 2023-2024
-  addTx({
-    dateTime: '2023-12-28 08:00:00',
-    date: '2023-12-28',
-    section: 'Dividends',
-    assetCategory: 'DIV',
-    symbol: 'NVDA',
-    underlying: 'NVDA',
-    action: 'DIV',
-    quantity: 1,
-    price: 4.00,
-    proceeds: 4.00,
-    commission: 0,
-    netCashFlow: 4.00,
-    currency: 'USD',
-    fxRateToBase: 0.90,
-    tradeId: 'NVDA-DIV-1',
-    notes: 'Gross Dividend (100 shs x $0.04)',
-  });
-  addTx({
-    dateTime: '2023-12-28 08:00:01',
-    date: '2023-12-28',
-    section: 'Withholding Tax',
-    assetCategory: 'TAX',
-    symbol: 'NVDA',
-    underlying: 'NVDA',
-    action: 'TAX',
-    quantity: 1,
-    price: -0.60,
-    proceeds: -0.60,
-    commission: 0,
-    netCashFlow: -0.60,
-    currency: 'USD',
-    fxRateToBase: 0.90,
-    tradeId: 'NVDA-TAX-1',
-    notes: '15% US Withholding Tax',
-  });
-
-  addTx({
-    dateTime: '2024-03-27 08:00:00',
-    date: '2024-03-27',
-    section: 'Dividends',
-    assetCategory: 'DIV',
-    symbol: 'NVDA',
-    underlying: 'NVDA',
-    action: 'DIV',
-    quantity: 1,
-    price: 4.00,
-    proceeds: 4.00,
-    commission: 0,
-    netCashFlow: 4.00,
-    currency: 'USD',
-    fxRateToBase: 0.92,
-    tradeId: 'NVDA-DIV-2',
-    notes: 'Gross Dividend $4.00',
-  });
-  addTx({
-    dateTime: '2024-03-27 08:00:01',
-    date: '2024-03-27',
-    section: 'Withholding Tax',
-    assetCategory: 'TAX',
-    symbol: 'NVDA',
-    underlying: 'NVDA',
-    action: 'TAX',
-    quantity: 1,
-    price: -0.60,
-    proceeds: -0.60,
-    commission: 0,
-    netCashFlow: -0.60,
-    currency: 'USD',
-    fxRateToBase: 0.92,
-    tradeId: 'NVDA-TAX-2',
-    notes: '15% US Withholding Tax',
-  });
-
-  // 7. Partial Stock Sell: 30 shares sold @ $885.00
-  // Tests exact proportional cost pool reduction before split!
-  addTx({
-    dateTime: '2024-04-12 10:15:00',
-    date: '2024-04-12',
-    section: 'Trades',
-    assetCategory: 'STK',
-    symbol: 'NVDA',
-    underlying: 'NVDA',
-    action: 'SELL',
-    quantity: -30,
-    price: 885.00,
-    proceeds: 26550.00,
-    commission: -1.25,
-    netCashFlow: 26548.75,
-    currency: 'USD',
-    fxRateToBase: 0.93,
-    tradeId: 'NVDA-SELL-1',
-    notes: 'Partial profit trim: 30 shares @ $885 (70 shares remaining)',
-  });
-
-  // 8. 10-for-1 Forward Split on June 10, 2024 (70 shares -> 700 shares)
-  addTx({
-    dateTime: '2024-06-10 09:00:00',
-    date: '2024-06-10',
-    section: 'Corporate Actions',
-    assetCategory: 'CORP_ACTION',
-    symbol: 'NVDA',
-    underlying: 'NVDA',
-    action: 'SPLIT',
-    quantity: 10,
-    price: 0,
-    proceeds: 0,
-    commission: 0,
-    netCashFlow: 0,
-    currency: 'USD',
-    fxRateToBase: 1,
-    tradeId: 'NVDA-SPLIT-1',
-    notes: 'NVDA Forward Split 10 for 1',
-  });
-
-  // 9. Post-Split Covered Calls: Sell 7x Sep 20 '24 $135 Call @ $4.50 (+$3,150)
-  addTx({
-    dateTime: '2024-08-09 14:15:00',
-    date: '2024-08-09',
-    section: 'Trades',
-    assetCategory: 'OPT',
-    symbol: 'NVDA  240920C00135000',
-    underlying: 'NVDA',
-    action: 'SELL',
-    quantity: -7,
-    price: 4.50,
-    proceeds: 3150.00,
-    commission: -8.75,
-    netCashFlow: 3141.25,
-    currency: 'USD',
-    fxRateToBase: 0.91,
-    tradeId: 'NVDA-OPT-3',
-    notes: 'Post-split Covered Call 7x @ $4.50 (+$3,150 credit)',
-    optionDetails: { type: 'CALL', strike: 135, expiry: '2024-09-20', isShort: true },
-    bucket: 'LINKED',
-  });
-
-  // 10. Post-Split Covered Call: Sell 7x Jan 17 '25 $155 Call @ $6.10 (+$4,270)
-  addTx({
-    dateTime: '2024-11-20 15:30:00',
-    date: '2024-11-20',
-    section: 'Trades',
-    assetCategory: 'OPT',
-    symbol: 'NVDA  250117C00155000',
-    underlying: 'NVDA',
-    action: 'SELL',
-    quantity: -7,
-    price: 6.10,
-    proceeds: 4270.00,
-    commission: -8.75,
-    netCashFlow: 4261.25,
-    currency: 'USD',
-    fxRateToBase: 0.95,
-    tradeId: 'NVDA-OPT-4',
-    notes: 'Active Covered Call campaign: 7x $155 Jan 25 (+4,270 credit)',
-    optionDetails: { type: 'CALL', strike: 155, expiry: '2025-01-17', isShort: true },
-    bucket: 'LINKED',
-  });
-
-  // 11. Standalone Speculative Trade (Bucket B): 2x NVDA $140 Call (Buy then Sell)
-  addTx({
-    dateTime: '2024-07-02 11:00:00',
-    date: '2024-07-02',
-    section: 'Trades',
-    assetCategory: 'OPT',
-    symbol: 'NVDA  240816C00140000',
-    underlying: 'NVDA',
-    action: 'BUY',
-    quantity: 2,
-    price: 7.50,
-    proceeds: -1500.00,
-    commission: -2.50,
-    netCashFlow: -1502.50,
-    currency: 'USD',
-    fxRateToBase: 0.93,
-    tradeId: 'NVDA-SPEC-1A',
-    notes: 'Speculative Earnings Play: 2x Long Calls @ $7.50',
-    optionDetails: { type: 'CALL', strike: 140, expiry: '2024-08-16', isShort: false },
-    bucket: 'STANDALONE',
-  });
-
-  addTx({
-    dateTime: '2024-07-18 15:45:00',
-    date: '2024-07-18',
-    section: 'Trades',
-    assetCategory: 'OPT',
-    symbol: 'NVDA  240816C00140000',
-    underlying: 'NVDA',
-    action: 'SELL',
-    quantity: -2,
-    price: 14.00,
-    proceeds: 2800.00,
-    commission: -2.50,
-    netCashFlow: 2797.50,
-    currency: 'USD',
-    fxRateToBase: 0.92,
-    tradeId: 'NVDA-SPEC-1B',
-    notes: 'Speculative Close: Sold @ $14.00 (+86% ROI / +$1,300 P&L)',
-    optionDetails: { type: 'CALL', strike: 140, expiry: '2024-08-16', isShort: true },
-    bucket: 'STANDALONE',
-  });
-
-  // -------------------------------------------------------------
-  // AAPL: Steady Dividend Growth + Systematic Covered Calls
-  // -------------------------------------------------------------
-  addTx({
-    dateTime: '2022-10-14 14:00:00',
-    date: '2022-10-14',
-    section: 'Trades',
-    assetCategory: 'STK',
-    symbol: 'AAPL',
-    underlying: 'AAPL',
-    action: 'BUY',
-    quantity: 100,
-    price: 138.50,
-    proceeds: -13850.00,
-    commission: -1.00,
-    netCashFlow: -13851.00,
-    currency: 'USD',
-    fxRateToBase: 1.02,
-    tradeId: 'AAPL-BUY-1',
-    notes: 'Bought 100 shares @ $138.50',
-  });
-
-  addTx({
-    dateTime: '2023-03-08 15:20:00',
-    date: '2023-03-08',
-    section: 'Trades',
-    assetCategory: 'STK',
-    symbol: 'AAPL',
-    underlying: 'AAPL',
-    action: 'BUY',
-    quantity: 100,
-    price: 152.00,
-    proceeds: -15200.00,
-    commission: -1.00,
-    netCashFlow: -15201.00,
-    currency: 'USD',
-    fxRateToBase: 0.95,
-    tradeId: 'AAPL-BUY-2',
-    notes: 'Added 100 shares @ $152.00 (Total 200 shares)',
-  });
-
-  // AAPL Covered calls
-  addTx({
-    dateTime: '2023-06-16 11:00:00',
-    date: '2023-06-16',
-    section: 'Trades',
-    assetCategory: 'OPT',
-    symbol: 'AAPL  230818C00190000',
-    underlying: 'AAPL',
-    action: 'SELL',
-    quantity: -2,
-    price: 4.80,
-    proceeds: 960.00,
-    commission: -2.50,
-    netCashFlow: 957.50,
-    currency: 'USD',
-    fxRateToBase: 0.91,
-    tradeId: 'AAPL-OPT-1',
-    notes: 'Covered Calls 2x @ $4.80 (+$960 credit)',
-    optionDetails: { type: 'CALL', strike: 190, expiry: '2023-08-18', isShort: true },
-    bucket: 'LINKED',
-  });
-
-  addTx({
-    dateTime: '2024-01-19 14:00:00',
-    date: '2024-01-19',
-    section: 'Trades',
-    assetCategory: 'OPT',
-    symbol: 'AAPL  240315C00200000',
-    underlying: 'AAPL',
-    action: 'SELL',
-    quantity: -2,
-    price: 5.40,
-    proceeds: 1080.00,
-    commission: -2.50,
-    netCashFlow: 1077.50,
-    currency: 'USD',
-    fxRateToBase: 0.92,
-    tradeId: 'AAPL-OPT-2',
-    notes: 'Covered Calls 2x @ $5.40 (+$1,080 credit)',
-    optionDetails: { type: 'CALL', strike: 200, expiry: '2024-03-15', isShort: true },
-    bucket: 'LINKED',
-  });
-
-  // AAPL quarterly dividends
-  const aaplDivDates = ['2023-02-16', '2023-05-18', '2023-08-17', '2023-11-16', '2024-02-15', '2024-05-16', '2024-08-15', '2024-11-14'];
-  aaplDivDates.forEach((d, idx) => {
-    const gross = idx === 0 ? 23.00 : 50.00; // 100 shares early, then 200 shares
-    const tax = Number((gross * 0.15).toFixed(2));
-    addTx({
-      dateTime: `${d} 08:00:00`,
-      date: d,
-      section: 'Dividends',
-      assetCategory: 'DIV',
-      symbol: 'AAPL',
-      underlying: 'AAPL',
-      action: 'DIV',
-      quantity: 1,
-      price: gross,
-      proceeds: gross,
-      commission: 0,
-      netCashFlow: gross,
-      currency: 'USD',
-      fxRateToBase: 0.92,
-      tradeId: `AAPL-DIV-${idx}`,
-      notes: `AAPL Quarterly Dividend ($${gross})`,
-    });
-    addTx({
-      dateTime: `${d} 08:00:01`,
-      date: d,
-      section: 'Withholding Tax',
-      assetCategory: 'TAX',
-      symbol: 'AAPL',
-      underlying: 'AAPL',
-      action: 'TAX',
-      quantity: 1,
-      price: -tax,
-      proceeds: -tax,
-      commission: 0,
-      netCashFlow: -tax,
-      currency: 'USD',
-      fxRateToBase: 0.92,
-      tradeId: `AAPL-TAX-${idx}`,
-      notes: '15% US Withholding Tax',
-    });
-  });
-
-  // -------------------------------------------------------------
-  // TSLA: Cash-Secured Put Assigned into Stock + Wheel CC Strategy
-  // -------------------------------------------------------------
-  // 1. Initial Cash-Secured Put sold
-  addTx({
-    dateTime: '2023-04-18 11:30:00',
-    date: '2023-04-18',
-    section: 'Trades',
-    assetCategory: 'OPT',
-    symbol: 'TSLA  230519P00180000',
-    underlying: 'TSLA',
-    action: 'SELL',
-    quantity: -1,
-    price: 8.50,
-    proceeds: 850.00,
-    commission: -1.30,
-    netCashFlow: 848.70,
-    currency: 'USD',
-    fxRateToBase: 0.91,
-    tradeId: 'TSLA-CSP-1',
-    notes: 'Cash-Secured Put Sell to Open (+850 credit)',
-    optionDetails: { type: 'PUT', strike: 180, expiry: '2023-05-19', isShort: true },
-    bucket: 'LINKED',
-  });
-
-  // 2. Assigned 100 shares at $180.00
-  addTx({
-    dateTime: '2023-05-19 16:00:00',
-    date: '2023-05-19',
-    section: 'Trades',
-    assetCategory: 'STK',
-    symbol: 'TSLA',
-    underlying: 'TSLA',
-    action: 'BUY',
-    quantity: 100,
-    price: 180.00,
-    proceeds: -18000.00,
-    commission: 0,
-    netCashFlow: -18000.00,
-    currency: 'USD',
-    fxRateToBase: 0.92,
-    tradeId: 'TSLA-ASSIGN-1',
-    notes: 'Assignment of 100 shares from $180 Put',
-  });
-
-  // 3. Covered Call campaign on assigned shares
-  addTx({
-    dateTime: '2023-07-21 14:00:00',
-    date: '2023-07-21',
-    section: 'Trades',
-    assetCategory: 'OPT',
-    symbol: 'TSLA  230818C00280000',
-    underlying: 'TSLA',
-    action: 'SELL',
-    quantity: -1,
-    price: 9.80,
-    proceeds: 980.00,
-    commission: -1.30,
-    netCashFlow: 978.70,
-    currency: 'USD',
-    fxRateToBase: 0.89,
-    tradeId: 'TSLA-CC-1',
-    notes: 'Covered Call Sell to Open (+$980 credit)',
-    optionDetails: { type: 'CALL', strike: 280, expiry: '2023-08-18', isShort: true },
-    bucket: 'LINKED',
-  });
-
-  addTx({
-    dateTime: '2024-04-26 15:00:00',
-    date: '2024-04-26',
-    section: 'Trades',
-    assetCategory: 'OPT',
-    symbol: 'TSLA  240621C00220000',
-    underlying: 'TSLA',
-    action: 'SELL',
-    quantity: -1,
-    price: 8.20,
-    proceeds: 820.00,
-    commission: -1.30,
-    netCashFlow: 818.70,
-    currency: 'USD',
-    fxRateToBase: 0.93,
-    tradeId: 'TSLA-CC-2',
-    notes: 'Covered Call Sell to Open (+$820 credit)',
-    optionDetails: { type: 'CALL', strike: 220, expiry: '2024-06-21', isShort: true },
-    bucket: 'LINKED',
-  });
-
-  // -------------------------------------------------------------
-  // SPY: Core S&P 500 Index ETF Foundation
-  // -------------------------------------------------------------
-  addTx({
-    dateTime: '2022-06-17 10:00:00',
-    date: '2022-06-17',
-    section: 'Trades',
-    assetCategory: 'STK',
-    symbol: 'SPY',
-    underlying: 'SPY',
-    action: 'BUY',
-    quantity: 50,
-    price: 368.50,
-    proceeds: -18425.00,
-    commission: -1.00,
-    netCashFlow: -18426.00,
-    currency: 'USD',
-    fxRateToBase: 0.95,
-    tradeId: 'SPY-BUY-1',
-    notes: 'Core ETF buy: 50 shares @ $368.50',
-  });
-
-  addTx({
-    dateTime: '2023-01-06 11:30:00',
-    date: '2023-01-06',
-    section: 'Trades',
-    assetCategory: 'STK',
-    symbol: 'SPY',
-    underlying: 'SPY',
-    action: 'BUY',
-    quantity: 30,
-    price: 388.00,
-    proceeds: -11640.00,
-    commission: -1.00,
-    netCashFlow: -11641.00,
-    currency: 'USD',
-    fxRateToBase: 0.94,
-    tradeId: 'SPY-BUY-2',
-    notes: 'Core ETF buy: 30 shares @ $388.00 (Total 80 shares)',
-  });
-
-  // SPY dividends
-  const spyDivs = [
-    { date: '2023-03-31', gross: 120.40 },
-    { date: '2023-06-30', gross: 131.20 },
-    { date: '2023-09-29', gross: 127.10 },
-    { date: '2023-12-29', gross: 152.50 },
-    { date: '2024-03-29', gross: 128.80 },
-    { date: '2024-06-28', gross: 142.60 },
-    { date: '2024-09-30', gross: 139.20 },
-  ];
-  spyDivs.forEach((d, idx) => {
-    const tax = Number((d.gross * 0.15).toFixed(2));
-    addTx({
-      dateTime: `${d.date} 08:00:00`,
-      date: d.date,
-      section: 'Dividends',
-      assetCategory: 'DIV',
-      symbol: 'SPY',
-      underlying: 'SPY',
-      action: 'DIV',
-      quantity: 1,
-      price: d.gross,
-      proceeds: d.gross,
-      commission: 0,
-      netCashFlow: d.gross,
-      currency: 'USD',
-      fxRateToBase: 0.92,
-      tradeId: `SPY-DIV-${idx}`,
-      notes: `SPY Quarterly Dividend ($${d.gross})`,
-    });
-    addTx({
-      dateTime: `${d.date} 08:00:01`,
-      date: d.date,
-      section: 'Withholding Tax',
-      assetCategory: 'TAX',
-      symbol: 'SPY',
-      underlying: 'SPY',
-      action: 'TAX',
-      quantity: 1,
-      price: -tax,
-      proceeds: -tax,
-      commission: 0,
-      netCashFlow: -tax,
-      currency: 'USD',
-      fxRateToBase: 0.92,
-      tradeId: `SPY-TAX-${idx}`,
-      notes: '15% US Withholding Tax',
-    });
-  });
-
-  // -------------------------------------------------------------
-  // ASML: European Semiconductor Leader (EUR Native Currency)
-  // -------------------------------------------------------------
-  addTx({
-    dateTime: '2023-02-10 10:15:00',
-    date: '2023-02-10',
-    section: 'Trades',
-    assetCategory: 'STK',
-    symbol: 'ASML',
-    underlying: 'ASML',
-    action: 'BUY',
-    quantity: 40,
-    price: 615.00,
-    proceeds: -24600.00,
-    commission: -2.50,
-    netCashFlow: -24602.50,
-    currency: 'EUR',
-    fxRateToBase: 1.0,
-    tradeId: 'ASML-BUY-1',
-    notes: 'Bought 40 shares @ €615.00 in EUR',
-  });
-
-  addTx({
-    dateTime: '2023-11-08 09:30:00',
-    date: '2023-11-08',
-    section: 'Dividends',
-    assetCategory: 'DIV',
-    symbol: 'ASML',
-    underlying: 'ASML',
-    action: 'DIV',
-    quantity: 1,
-    price: 58.00,
-    proceeds: 58.00,
-    commission: 0,
-    netCashFlow: 58.00,
-    currency: 'EUR',
-    fxRateToBase: 1.0,
-    tradeId: 'ASML-DIV-1',
-    notes: 'ASML Interim Dividend €58.00',
-  });
-  addTx({
-    dateTime: '2023-11-08 09:30:01',
-    date: '2023-11-08',
-    section: 'Withholding Tax',
-    assetCategory: 'TAX',
-    symbol: 'ASML',
-    underlying: 'ASML',
-    action: 'TAX',
-    quantity: 1,
-    price: -8.70,
-    proceeds: -8.70,
-    commission: 0,
-    netCashFlow: -8.70,
-    currency: 'EUR',
-    fxRateToBase: 1.0,
-    tradeId: 'ASML-TAX-1',
-    notes: 'Dutch 15% Dividend Tax',
-  });
-
-  // Sort chronological
-  demoList.sort((a, b) => new Date(a.dateTime).getTime() - new Date(b.dateTime).getTime());
-
-  return demoList;
-}
 
 /**
  * Export portfolio state to JSON file download
@@ -1297,6 +591,7 @@ export function exportPortfolioToJson(
     depositsBase?: number;
     withdrawalsBase?: number;
     netDepositsBase?: number;
+    cashByCurrency?: Record<string, number>;
   }
 ): string {
   const exportPayload = {
@@ -1466,6 +761,7 @@ export function parseIBKRFlexXML(
   depositsBase?: number;
   withdrawalsBase?: number;
   netDepositsBase?: number;
+  cashByCurrency?: Record<string, number>;
   errors: string[];
 } {
   const transactions: Transaction[] = [];
@@ -1478,6 +774,7 @@ export function parseIBKRFlexXML(
   let depositsBase: number | undefined;
   let withdrawalsBase: number | undefined;
   let netDepositsBase: number | undefined;
+  const cashByCurrency: Record<string, number> = {};
   const errors: string[] = [];
 
   try {
@@ -1537,8 +834,9 @@ export function parseIBKRFlexXML(
       return 1;
     };
 
-    // 0B. Parse <CashReport> ending cash & deposits/withdrawals summary (BASE_SUMMARY row is first CashReportCurrency)
-    const cashReportFirst = doc.querySelector('CashReport > CashReportCurrency');
+    // 0B. Parse <CashReport> ending cash, per-currency cash buckets & deposits/withdrawals summary
+    const cashReportNodes = Array.from(doc.querySelectorAll('CashReport > CashReportCurrency, CashReportCurrency'));
+    const cashReportFirst = cashReportNodes[0];
     if (cashReportFirst) {
       const ending = parseFloat(cashReportFirst.getAttribute('endingCash') || '');
       if (!isNaN(ending)) endingCashBase = ending;
@@ -1549,6 +847,36 @@ export function parseIBKRFlexXML(
       const netDep = parseFloat(cashReportFirst.getAttribute('depositWithdrawals') || '');
       if (!isNaN(netDep)) netDepositsBase = netDep;
       else if (depositsBase !== undefined) netDepositsBase = depositsBase - (withdrawalsBase || 0);
+    }
+
+    // Extract per-currency endingCash balances when multiple CashReportCurrency nodes are present
+    const nonBaseNodes = cashReportNodes.filter((n) => (n.getAttribute('currency') || '').toUpperCase() !== 'BASE_SUMMARY');
+    const explicitCurrencyNodes = nonBaseNodes.filter((n) => Boolean(n.getAttribute('currency')));
+    if (explicitCurrencyNodes.length > 0) {
+      for (const n of explicitCurrencyNodes) {
+        const cur = (n.getAttribute('currency') || '').toUpperCase();
+        const endVal = parseFloat(n.getAttribute('endingCash') || '');
+        if (cur && !isNaN(endVal)) {
+          cashByCurrency[cur] = endVal;
+        }
+      }
+    } else if (cashReportNodes.length === 3 && endingCashBase !== undefined) {
+      // Standard IBKR 3-row CashReport when currency attr is omitted: [BASE_SUMMARY, baseCurrency, foreignCurrency]
+      const otherCurrency = baseCurrency === 'EUR' ? 'USD' : 'EUR';
+      const c1 = parseFloat(cashReportNodes[1].getAttribute('endingCash') || '');
+      const c2 = parseFloat(cashReportNodes[2].getAttribute('endingCash') || '');
+      const fxOtherToBase = fxRates[`${otherCurrency}->${baseCurrency}`] || (baseCurrency === 'EUR' ? 0.91 : 1.099);
+      if (!isNaN(c1) && !isNaN(c2)) {
+        const errDirect = Math.abs(c1 + c2 * fxOtherToBase - endingCashBase);
+        const errSwapped = Math.abs(c2 + c1 * fxOtherToBase - endingCashBase);
+        if (errDirect < errSwapped && errDirect < Math.max(5, Math.abs(endingCashBase) * 0.02)) {
+          cashByCurrency[baseCurrency] = c1;
+          cashByCurrency[otherCurrency] = c2;
+        } else if (errSwapped < Math.max(5, Math.abs(endingCashBase) * 0.02)) {
+          cashByCurrency[baseCurrency] = c2;
+          cashByCurrency[otherCurrency] = c1;
+        }
+      }
     }
 
     if (netDepositsBase === undefined) {
@@ -1908,6 +1236,7 @@ export function parseIBKRFlexXML(
     depositsBase,
     withdrawalsBase,
     netDepositsBase,
+    cashByCurrency: Object.keys(cashByCurrency).length > 0 ? cashByCurrency : undefined,
     errors,
   };
 }
@@ -1926,6 +1255,7 @@ export function importPortfolioFromJson(
   depositsBase?: number;
   withdrawalsBase?: number;
   netDepositsBase?: number;
+  cashByCurrency?: Record<string, number>;
   duplicatesSkipped: number;
   error?: string;
 } {
@@ -1970,6 +1300,7 @@ export function importPortfolioFromJson(
       depositsBase: cashSummary?.depositsBase,
       withdrawalsBase: cashSummary?.withdrawalsBase,
       netDepositsBase: cashSummary?.netDepositsBase,
+      cashByCurrency: cashSummary?.cashByCurrency,
       duplicatesSkipped,
     };
   } catch (err: any) {
@@ -1999,6 +1330,7 @@ export function parseUniversalIBKRInput(
   depositsBase?: number;
   withdrawalsBase?: number;
   netDepositsBase?: number;
+  cashByCurrency?: Record<string, number>;
   duplicatesSkipped: number;
   sectionsFound: string[];
   baseCurrency: 'EUR' | 'USD';
@@ -2018,6 +1350,7 @@ export function parseUniversalIBKRInput(
       depositsBase: res.depositsBase,
       withdrawalsBase: res.withdrawalsBase,
       netDepositsBase: res.netDepositsBase,
+      cashByCurrency: res.cashByCurrency,
       duplicatesSkipped: res.duplicatesSkipped,
       sectionsFound: ['JSON Import'],
       baseCurrency: res.baseCurrency,

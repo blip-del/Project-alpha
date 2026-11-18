@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { parseIBKRFlexXML, parseIBKRActivityCSV, resolveUnderlyingTicker, assignSmartOptionBuckets } from './ibkrParser';
 import { calculatePortfolioState, calculateDownsideCushionPct, getFxMultiplier } from './portfolioEngine';
-import { calculateXIRR, computeStepDownData, computeMonthlyCashflows, computeActiveOptions } from './analyticsEngine';
+import { calculateXIRR, computeStepDownData, computeMonthlyCashflows, computeActiveOptions, computeCapitalAllocation } from './analyticsEngine';
 import type { Transaction } from '../types';
 
 function installMinimalDomParser() {
@@ -171,9 +171,10 @@ test('IBKR Flex XML statement reconciles cash summary, position marks, and separ
   );
   const sanOpt = activeOpts.find((o) => o.contractSymbol.includes('P SNW  20271217 88 M'));
   assert.ok(sanOpt);
+  assert.equal(sanOpt!.action, 'LONG');
   assert.equal(sanOpt!.spotPrice, 80);
-  // Put strike 88 vs spot 80 => ITM by -10.0%
-  assert.equal(sanOpt!.strikeCushionPct, -10);
+  // Long Put strike 88 vs spot 80 => +10.0% ITM (in favor of buyer)
+  assert.equal(sanOpt!.strikeCushionPct, 10);
 });
 
 test('CSV parser reads Deposits & Withdrawals and FX multiplier converts EUR/USD cleanly', () => {
@@ -194,3 +195,96 @@ test('CSV parser reads Deposits & Withdrawals and FX multiplier converts EUR/USD
   const monthly = computeMonthlyCashflows([], 'EUR');
   assert.equal(monthly.totalCashflow, 0);
 });
+
+test('Unified Ticker Matrix reconciles 100% with Global KPIs, FX Currency Buckets, Closed Tickers, Short OTM Signs & Bucket Invariance', () => {
+  installMinimalDomParser();
+  const xml = fs.readFileSync('public/assets/aistudio/IBKR_content_5667205778210155609_1c6ba69a.xml', 'utf8');
+  const parsed = parseIBKRFlexXML(xml);
+
+  // 1. Per-currency cash extraction from 3-row CashReportCurrency
+  assert.ok(parsed.cashByCurrency);
+  assert.ok(Math.abs((parsed.cashByCurrency!.EUR || 0) - 843.73) < 0.05);
+  assert.ok(Math.abs((parsed.cashByCurrency!.USD || 0) - 2239.33) < 0.05);
+
+  const portfolio = calculatePortfolioState(parsed.transactions, {}, {}, 'EUR', parsed.fxRates, parsed.positionMarks);
+
+  // 2. Algebraic reconciliation: Sum of unifiedTickers === Summary totals
+  const sumOpen = portfolio.unifiedTickers.reduce((s, t) => s + t.activeOpenPnlBase, 0);
+  const sumRealized = portfolio.unifiedTickers.reduce((s, t) => s + t.realizedPnlBase, 0);
+  const sumNet = portfolio.unifiedTickers.reduce((s, t) => s + t.totalNetPnlBase, 0);
+
+  assert.ok(Math.abs(sumOpen - portfolio.summary.totalActiveOpenPnlBase) < 0.01);
+  assert.ok(Math.abs(sumRealized - portfolio.summary.totalRealizedAllPnlBase) < 0.01);
+  assert.ok(Math.abs(sumNet - portfolio.summary.totalNetAllPnlBase) < 0.01);
+
+  for (const ut of portfolio.unifiedTickers) {
+    assert.ok(Math.abs(ut.activeOpenPnlBase + ut.realizedPnlBase - ut.totalNetPnlBase) < 0.01);
+    if (ut.annualizedReturnPct !== null) {
+      assert.ok(ut.annualizedReturnPct >= -100 && ut.annualizedReturnPct <= 999);
+    }
+    for (const c of ut.campaigns) {
+      if (c.annualizedReturnPct !== null && Math.abs(c.netPnlBase) > 1) {
+        if (c.netPnlBase < -1) {
+          assert.ok(c.annualizedReturnPct <= 0, `Expected negative/zero annualized return for losing campaign ${ut.ticker} ${c.contractSymbol}, got ${c.annualizedReturnPct}`);
+        } else if (c.netPnlBase > 1) {
+          assert.ok(c.annualizedReturnPct >= 0, `Expected non-negative annualized return for winning campaign ${ut.ticker} ${c.contractSymbol}, got ${c.annualizedReturnPct}`);
+        }
+      }
+    }
+  }
+
+  // 3. Closed tickers (WULF, BMPS, ORCL) appear cleanly with isActive === false & WULF expired short call credit captured
+  const wulf = portfolio.unifiedTickers.find((t) => t.ticker === 'WULF');
+  const bmps = portfolio.unifiedTickers.find((t) => t.ticker === 'BMPS');
+  const orcl = portfolio.unifiedTickers.find((t) => t.ticker === 'ORCL');
+  assert.ok(wulf && !wulf.isActive && wulf.realizedPnlNative > 30);
+  assert.ok(bmps && !bmps.isActive);
+  assert.ok(orcl && !orcl.isActive);
+
+  // 4. CAPR $20 short call is deeply OTM (>135%) and must NEVER be tagged TESTED
+  const activeOpts = computeActiveOptions(
+    portfolio.positions,
+    portfolio.standalonePositions,
+    {},
+    parsed.positionMarks,
+    'EUR',
+    parsed.fxRates,
+    portfolio.closedPositions
+  );
+  const capr20C = activeOpts.find((o) => o.contractSymbol.includes('261218C00020000'));
+  assert.ok(capr20C);
+  assert.equal(capr20C!.action, 'SHORT');
+  assert.ok(capr20C!.strikeCushionPct > 135, `Expected CAPR $20C cushion > 135%, got ${capr20C!.strikeCushionPct}`);
+  assert.notEqual(capr20C!.statusTag, 'TESTED');
+
+  // 5. Currency Buckets decompose 100% of Net Liq Value (Holdings + Cash)
+  const alloc = computeCapitalAllocation(
+    portfolio.positions,
+    portfolio.standalonePositions,
+    parsed.transactions,
+    'EUR',
+    parsed.fxRates,
+    parsed.endingCashBase,
+    parsed.cashByCurrency,
+    portfolio.closedPositions
+  );
+  assert.ok(Math.abs(alloc.usdPercent + alloc.eurPercent - 100) < 0.05);
+  const expectedNetLiq = portfolio.summary.totalMarketValue + (parsed.endingCashBase || 0);
+  assert.ok(Math.abs(alloc.usdAmount + alloc.eurAmount - expectedNetLiq) < 0.25);
+
+  // 6. Toggling a NOK option campaign between LINKED <-> STANDALONE alters Real Entry & Cushion while keeping Total Net P&L invariant
+  const nokBefore = portfolio.unifiedTickers.find((t) => t.ticker === 'NOK')!;
+  const nokCamp = nokBefore.campaigns.find((c) => c.kind === 'OPTION_CAMPAIGN' && c.bucket === 'LINKED')!;
+  const overrides: Record<string, 'LINKED' | 'STANDALONE'> = {};
+  for (const id of nokCamp.transactionIds) overrides[id] = 'STANDALONE';
+
+  const toggled = calculatePortfolioState(parsed.transactions, overrides, {}, 'EUR', parsed.fxRates, parsed.positionMarks);
+  const nokAfter = toggled.unifiedTickers.find((t) => t.ticker === 'NOK')!;
+
+  assert.notEqual(nokAfter.realEntryPrice, nokBefore.realEntryPrice);
+  assert.notEqual(nokAfter.cushionPct, nokBefore.cushionPct);
+  assert.ok(Math.abs(nokAfter.totalNetPnlBase - nokBefore.totalNetPnlBase) < 0.01);
+  assert.ok(Math.abs(nokAfter.activeOpenPnlBase - nokBefore.activeOpenPnlBase) < 0.01);
+  assert.ok(Math.abs(nokAfter.realizedPnlBase - nokBefore.realizedPnlBase) < 0.01);
+});
+

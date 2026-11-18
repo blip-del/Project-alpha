@@ -32,6 +32,7 @@ export interface BrokerCashSummary {
   depositsBase?: number;
   withdrawalsBase?: number;
   netDepositsBase?: number;
+  cashByCurrency?: Record<string, number>;
   currency: 'EUR' | 'USD';
 }
 
@@ -110,6 +111,7 @@ export interface OptionCampaign {
   totalDebits: number;
   netCashFlow: number;
   realizedPnl: number;
+  openCostBasis?: number;
   currentMarkPrice?: number;
   marketValue?: number;
   unrealizedPnl?: number;
@@ -174,6 +176,74 @@ export interface StandaloneOptionPosition {
   trades: Transaction[];
 }
 
+export interface CampaignComparisonItem {
+  id: string;
+  kind: 'STOCK_LOT' | 'OPTION_CAMPAIGN' | 'DIVIDENDS';
+  contractSymbol: string;
+  title: string;
+  strategyType: string;
+  bucket: BucketType;
+  canToggleBucket: boolean;
+  transactionIds: string[];
+  status: 'OPEN' | 'CLOSED';
+  dte?: number;
+  expiry?: string;
+  strike?: number;
+  optionType?: 'CALL' | 'PUT';
+  netContracts?: number;
+  strikeCushionPct?: number;
+  currency: string;
+  capitalDeployedNative: number;
+  capitalDeployedBase: number;
+  netCashNative: number;
+  realizedPnlNative: number;
+  unrealizedPnlNative: number;
+  netPnlNative: number;
+  netPnlBase: number;
+  tradeRoiPct: number;
+  annualizedReturnPct: number | null;
+  holdingDays: number;
+  trades: Transaction[];
+}
+
+export interface UnifiedTickerSummary {
+  ticker: string;
+  companyName: string;
+  currency: string;
+  isActive: boolean;
+  hasStockPosition: boolean;
+  hasOpenOptions: boolean;
+  spotPrice: number;
+  spotChange: number;
+  spotChangePct: number;
+  currentShares: number;
+  openOptionCount: number;
+  totalCampaignCount: number;
+  rawAvgEntry: number;
+  realEntryPrice: number;
+  basisReductionPct: number;
+  cushionPct: number;
+  stockMarketValueNative: number;
+  stockMarketValueBase: number;
+  openOptionsMarketValueNative: number;
+  openOptionsMarketValueBase: number;
+  totalExposureBase: number;
+  capitalAtRiskNative: number;
+  capitalAtRiskBase: number;
+  activeOpenPnlNative: number;
+  activeOpenPnlBase: number;
+  activeOpenPnlPct: number;
+  realizedPnlNative: number;
+  realizedPnlBase: number;
+  totalNetPnlNative: number;
+  totalNetPnlBase: number;
+  annualizedReturnPct: number | null;
+  isShortDuration: boolean;
+  holdingDays: number;
+  stockPosition?: StockPosition;
+  campaigns: CampaignComparisonItem[];
+}
+
 export interface PortfolioSummary {
   totalMarketValue: number; // Active Stocks + Open Options net market value (in baseCurrency)
   totalStockMarketValue: number; // Active Stocks market value (in baseCurrency)
@@ -191,6 +261,11 @@ export interface PortfolioSummary {
   totalNetBasisReduction: number; // (Raw Basis - Real Basis)
   weightedDownsideCushionPct: number;
   overallYoCPct: number;
+  // Reconciled KPI totals (matching sum of unifiedTickers)
+  totalActiveOpenPnlBase: number;
+  totalRealizedAllPnlBase: number;
+  totalNetAllPnlBase: number;
+  shortPutCollateralBase: number;
   baseCurrency: 'EUR' | 'USD';
   openStockCount: number;
   openOptionCount: number;
@@ -219,12 +294,14 @@ export interface ActiveOptionMetric {
   contracts: number;
   entryPrice: number;
   currentPrice: number;
+  unrealizedPnlNative: number;
+  unrealizedPnlBase: number;
   strikeCushionPct: number;
   profitCapturedPct: number;
   extrinsicRemaining: number;
   annualizedApr: number;
   thetaPerDay: number;
-  statusTag: 'ROLL_CANDIDATE' | 'SWEET_SPOT' | 'EXPIRING_SOON' | 'ACTIVE';
+  statusTag: 'ROLL_CANDIDATE' | 'SWEET_SPOT' | 'EXPIRING_SOON' | 'TESTED' | 'ACTIVE';
   statusLabel: string;
   bucket: BucketType;
   currency?: string;
@@ -240,6 +317,7 @@ export interface CapitalAllocation {
   eurAmount: number;
   usdPercent: number;
   eurPercent: number;
+  usdToEurRate: number;
 }
 
 export interface AdvancedKPIs {
@@ -251,6 +329,18 @@ export interface AdvancedKPIs {
   netGainDollars: number;
 }
 
+export interface OptionalPanelsState {
+  stepDown: boolean;
+  monthlyCashflow: boolean;
+  expiryMatrix: boolean;
+}
+
+export const DEFAULT_OPTIONAL_PANELS: OptionalPanelsState = {
+  stepDown: false,
+  monthlyCashflow: false,
+  expiryMatrix: false,
+};
+
 export interface ViewVisibilityState {
   // Overview KPIs
   kpi_portfolio_value: boolean;
@@ -259,6 +349,7 @@ export interface ViewVisibilityState {
   kpi_income: boolean;
   kpi_yoc: boolean;
   kpi_realized_pnl: boolean;
+  section_broker_funding: boolean;
 
   // Overview Charts
   chart_allocation: boolean;
@@ -266,9 +357,13 @@ export interface ViewVisibilityState {
   chart_waterfall: boolean;
   chart_cushion_ranking: boolean;
   chart_income_timeline: boolean;
-  section_standalone_options: boolean;
 
-  // Analytics Modules (Requested by prompt)
+  // Positions & Campaigns Sections
+  section_active_equities: boolean;
+  section_standalone_options: boolean;
+  section_closed_positions: boolean;
+
+  // Analytics Modules
   analytics_step_down: boolean;
   analytics_portfolio_deposits: boolean;
   analytics_monthly_income: boolean;
@@ -290,19 +385,22 @@ export const DEFAULT_VISIBILITY: ViewVisibilityState = {
   kpi_income: true,
   kpi_yoc: true,
   kpi_realized_pnl: true,
+  section_broker_funding: true,
   chart_allocation: true,
   chart_basis_comparison: true,
   chart_waterfall: true,
   chart_cushion_ranking: true,
   chart_income_timeline: true,
+  section_active_equities: true,
   section_standalone_options: true,
+  section_closed_positions: true,
 
-  analytics_step_down: true,
-  analytics_portfolio_deposits: true,
-  analytics_monthly_income: true,
-  analytics_standalone_pnl: true,
-  analytics_open_expiries: true,
-  analytics_allocation_fx: true,
+  analytics_step_down: false,
+  analytics_portfolio_deposits: false,
+  analytics_monthly_income: false,
+  analytics_standalone_pnl: false,
+  analytics_open_expiries: false,
+  analytics_allocation_fx: false,
 
   kpi_xirr: true,
   kpi_rom: true,

@@ -1,43 +1,38 @@
 /**
- * Options Analyzer Terminal -> Dedicated Portfolio Performance Tracker
- * Real Entry Price & Two-Bucket Engine with Offline IBKR Parser
+ * APEX // CHRONO-TRACKER
+ * Unified Ticker-Centric Portfolio Tracker & Two-Bucket Real Entry Engine
  */
 
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   Transaction,
   BucketType,
-  ViewVisibilityState,
-  DEFAULT_VISIBILITY,
   StockQuote,
   PositionMark,
   BrokerCashSummary,
+  OptionalPanelsState,
+  DEFAULT_OPTIONAL_PANELS,
 } from './types';
 import {
-  getDemoPortfolioTransactions,
   exportPortfolioToJson,
   importPortfolioFromJson,
 } from './utils/ibkrParser';
 import { calculatePortfolioState, getFxMultiplier } from './utils/portfolioEngine';
+import { computeCapitalAllocation } from './utils/analyticsEngine';
 import { fetchPortfolioQuotes } from './services/optionsService';
 import { Header } from './components/Header';
-import { VisibilityBar } from './components/VisibilityBar';
-import { OverviewTab } from './components/OverviewTab';
-import { PositionsTab } from './components/PositionsTab';
-import { AnalyticsTab } from './components/AnalyticsTab';
+import { TopKpiStrip } from './components/TopKpiStrip';
+import { UnifiedTickerMatrix } from './components/UnifiedTickerMatrix';
+import { OptionalDeepDivePanels } from './components/OptionalDeepDivePanels';
 import { LedgerImportTab } from './components/LedgerImportTab';
 import {
-  LayoutDashboard,
-  Layers,
-  LineChart,
+  LayoutGrid,
   FileSpreadsheet,
 } from 'lucide-react';
 
 export default function App() {
-  // Navigation: 4 main tabs
-  const [activeTab, setActiveTab] = useState<'OVERVIEW' | 'POSITIONS' | 'ANALYTICS' | 'LEDGER'>('OVERVIEW');
+  const [activeTab, setActiveTab] = useState<'PORTFOLIO' | 'LEDGER'>('PORTFOLIO');
 
-  // Base Currency: 'EUR' | 'USD'
   const [baseCurrency, setBaseCurrency] = useState<'EUR' | 'USD'>(() => {
     try {
       return (localStorage.getItem('ais_portfolio_base_currency') as 'EUR' | 'USD') || 'EUR';
@@ -46,33 +41,27 @@ export default function App() {
     }
   });
 
-  // Track whether currently loaded portfolio is the initial demo
-  const [isDemoPortfolio, setIsDemoPortfolio] = useState<boolean>(() => {
-    try {
-      const flag = localStorage.getItem('ais_portfolio_is_demo');
-      if (flag !== null) return flag === 'true';
-      const saved = localStorage.getItem('ais_portfolio_transactions');
-      return !saved || JSON.parse(saved).length === 0;
-    } catch {
-      return true;
-    }
-  });
-
-  // Persistent Transactions
   const [transactions, setTransactions] = useState<Transaction[]>(() => {
     try {
+      const legacyDemoFlag = localStorage.getItem('ais_portfolio_is_demo');
+      if (legacyDemoFlag !== null) {
+        localStorage.removeItem('ais_portfolio_is_demo');
+        if (legacyDemoFlag === 'true') {
+          localStorage.removeItem('ais_portfolio_transactions');
+          return [];
+        }
+      }
       const saved = localStorage.getItem('ais_portfolio_transactions');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed)) return parsed;
       }
     } catch (e) {
       console.warn('Failed to load saved transactions:', e);
     }
-    return getDemoPortfolioTransactions();
+    return [];
   });
 
-  // Persistent FX Rates & IBKR OpenPosition Marks
   const [fxRates, setFxRates] = useState<Record<string, number>>(() => {
     try {
       const saved = localStorage.getItem('ais_portfolio_fx_rates');
@@ -135,7 +124,15 @@ export default function App() {
     }
   });
 
-  // Persistent 1-Click Bucket Overrides
+  const [cashByCurrency, setCashByCurrency] = useState<Record<string, number> | undefined>(() => {
+    try {
+      const saved = localStorage.getItem('ais_portfolio_cash_by_cur');
+      return saved ? JSON.parse(saved) : undefined;
+    } catch {
+      return undefined;
+    }
+  });
+
   const [bucketOverrides, setBucketOverrides] = useState<Record<string, BucketType>>(() => {
     try {
       const saved = localStorage.getItem('ais_portfolio_bucket_overrides');
@@ -145,29 +142,25 @@ export default function App() {
     }
   });
 
-  // Persistent View & KPI Visibility
-  const [visibility, setVisibility] = useState<ViewVisibilityState>(() => {
+  const [optionalPanels, setOptionalPanels] = useState<OptionalPanelsState>(() => {
     try {
-      const saved = localStorage.getItem('ais_portfolio_visibility');
-      return saved ? { ...DEFAULT_VISIBILITY, ...JSON.parse(saved) } : DEFAULT_VISIBILITY;
+      const saved = localStorage.getItem('ais_portfolio_panels_v2');
+      return saved ? { ...DEFAULT_OPTIONAL_PANELS, ...JSON.parse(saved) } : DEFAULT_OPTIONAL_PANELS;
     } catch {
-      return DEFAULT_VISIBILITY;
+      return DEFAULT_OPTIONAL_PANELS;
     }
   });
 
-  // Live Stock Quotes
   const [quotes, setQuotes] = useState<Record<string, StockQuote>>({});
   const [isRefreshingQuotes, setIsRefreshingQuotes] = useState(false);
 
-  // Sync state to localStorage
   useEffect(() => {
     try {
       localStorage.setItem('ais_portfolio_transactions', JSON.stringify(transactions));
-      localStorage.setItem('ais_portfolio_is_demo', String(isDemoPortfolio));
     } catch (e) {
       console.warn('Failed saving transactions:', e);
     }
-  }, [transactions, isDemoPortfolio]);
+  }, [transactions]);
 
   useEffect(() => {
     try {
@@ -186,10 +179,15 @@ export default function App() {
       else localStorage.removeItem('ais_portfolio_withdrawals');
       if (netDepositsBase !== undefined) localStorage.setItem('ais_portfolio_net_deposits', String(netDepositsBase));
       else localStorage.removeItem('ais_portfolio_net_deposits');
+      if (cashByCurrency && Object.keys(cashByCurrency).length > 0) {
+        localStorage.setItem('ais_portfolio_cash_by_cur', JSON.stringify(cashByCurrency));
+      } else {
+        localStorage.removeItem('ais_portfolio_cash_by_cur');
+      }
     } catch (e) {
       console.warn('Failed saving FX/marks:', e);
     }
-  }, [fxRates, positionMarks, endingCashBase, endingCashCurrency, depositsBase, withdrawalsBase, netDepositsBase]);
+  }, [fxRates, positionMarks, endingCashBase, endingCashCurrency, depositsBase, withdrawalsBase, netDepositsBase, cashByCurrency]);
 
   useEffect(() => {
     try {
@@ -209,14 +207,15 @@ export default function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem('ais_portfolio_visibility', JSON.stringify(visibility));
+      localStorage.setItem('ais_portfolio_panels_v2', JSON.stringify(optionalPanels));
     } catch (e) {
-      console.warn('Failed saving visibility:', e);
+      console.warn('Failed saving optional panels:', e);
     }
-  }, [visibility]);
+  }, [optionalPanels]);
 
   // Fetch live market quotes with exchange-aware European suffix mapping
   const refreshQuotes = useCallback(async () => {
+    if (transactions.length === 0) return;
     const underlyingMeta = new Map<string, { currency: string; exchange?: string; isStk: boolean }>();
     for (const tx of transactions) {
       const und = tx.underlying || tx.symbol;
@@ -243,7 +242,9 @@ export default function App() {
     const querySymbols: string[] = [];
 
     for (const [und, meta] of underlyingMeta.entries()) {
-      const mark = positionMarks[und];
+      const mark =
+        positionMarks[und] ||
+        Object.values(positionMarks).find((m) => m.underlying === und && (m.underlyingListingExchange || m.listingExchange));
       const ex = (mark?.underlyingListingExchange || mark?.listingExchange || meta.exchange || '').toUpperCase();
       if (meta.currency === 'EUR') {
         if (ex === 'SBF' || ex === 'MONEP') {
@@ -256,7 +257,6 @@ export default function App() {
           yahooToAppSymbol.set(`${und}.AS`, und);
           querySymbols.push(`${und}.AS`);
         } else {
-          // Skip unmapped EUR tickers so we don't overwrite with colliding US ticker (e.g. SAN)
           continue;
         }
       } else {
@@ -303,7 +303,6 @@ export default function App() {
     refreshQuotes();
   }, [refreshQuotes]);
 
-  // Calculate chronological portfolio state using Two-Bucket engine
   const portfolioState = useMemo(() => {
     return calculatePortfolioState(
       transactions,
@@ -316,30 +315,69 @@ export default function App() {
   }, [transactions, bucketOverrides, quotes, baseCurrency, fxRates, positionMarks]);
 
   const endingCashInDisplayCurrency = useMemo(() => {
+    if (cashByCurrency && Object.keys(cashByCurrency).length > 0) {
+      return Object.entries(cashByCurrency).reduce(
+        (sum, [cur, amt]) => sum + amt * getFxMultiplier(cur, baseCurrency, fxRates),
+        0
+      );
+    }
     if (endingCashBase === undefined) return undefined;
     return endingCashBase * getFxMultiplier(endingCashCurrency, baseCurrency, fxRates);
-  }, [endingCashBase, endingCashCurrency, baseCurrency, fxRates]);
+  }, [cashByCurrency, endingCashBase, endingCashCurrency, baseCurrency, fxRates]);
 
   const cashSummaryInDisplayCurrency: BrokerCashSummary | undefined = useMemo(() => {
     if (
       endingCashBase === undefined &&
       depositsBase === undefined &&
       withdrawalsBase === undefined &&
-      netDepositsBase === undefined
+      netDepositsBase === undefined &&
+      !cashByCurrency
     ) {
       return undefined;
     }
     const fx = getFxMultiplier(endingCashCurrency, baseCurrency, fxRates);
     return {
-      endingCashBase: endingCashBase !== undefined ? endingCashBase * fx : undefined,
+      endingCashBase: endingCashInDisplayCurrency,
       depositsBase: depositsBase !== undefined ? depositsBase * fx : undefined,
       withdrawalsBase: withdrawalsBase !== undefined ? withdrawalsBase * fx : undefined,
       netDepositsBase: netDepositsBase !== undefined ? netDepositsBase * fx : undefined,
+      cashByCurrency,
       currency: baseCurrency,
     };
-  }, [endingCashBase, depositsBase, withdrawalsBase, netDepositsBase, endingCashCurrency, baseCurrency, fxRates]);
+  }, [
+    endingCashBase,
+    endingCashInDisplayCurrency,
+    depositsBase,
+    withdrawalsBase,
+    netDepositsBase,
+    cashByCurrency,
+    endingCashCurrency,
+    baseCurrency,
+    fxRates,
+  ]);
 
-  // Handlers
+  const allocation = useMemo(() => {
+    return computeCapitalAllocation(
+      portfolioState.positions,
+      portfolioState.standalonePositions,
+      transactions,
+      baseCurrency,
+      fxRates,
+      endingCashInDisplayCurrency,
+      cashByCurrency,
+      portfolioState.closedPositions
+    );
+  }, [
+    portfolioState.positions,
+    portfolioState.closedPositions,
+    portfolioState.standalonePositions,
+    transactions,
+    baseCurrency,
+    fxRates,
+    endingCashInDisplayCurrency,
+    cashByCurrency,
+  ]);
+
   const handleToggleBucket = (transactionId: string) => {
     setBucketOverrides((prev) => {
       const tx = transactions.find((t) => t.id === transactionId);
@@ -377,25 +415,16 @@ export default function App() {
       depositsBase?: number;
       withdrawalsBase?: number;
       netDepositsBase?: number;
-      replaceDemo?: boolean;
+      cashByCurrency?: Record<string, number>;
     }
   ) => {
-    if ((isDemoPortfolio || meta?.replaceDemo) && newTransactions.length > 0) {
-      // Replace demo portfolio cleanly on first real IBKR import
-      setTransactions(newTransactions);
-      setBucketOverrides({});
-      setIsDemoPortfolio(false);
-      setQuotes({});
-    } else {
-      setTransactions((prev) => {
-        const existingIds = new Set(prev.map((t) => t.id));
-        const fresh = newTransactions.filter((t) => !existingIds.has(t.id));
-        const merged = [...prev, ...fresh];
-        merged.sort((a, b) => (new Date(a.dateTime).getTime() || 0) - (new Date(b.dateTime).getTime() || 0));
-        return merged;
-      });
-      setIsDemoPortfolio(false);
-    }
+    setTransactions((prev) => {
+      const existingIds = new Set(prev.map((t) => t.id));
+      const fresh = newTransactions.filter((t) => !existingIds.has(t.id));
+      const merged = [...prev, ...fresh];
+      merged.sort((a, b) => (new Date(a.dateTime).getTime() || 0) - (new Date(b.dateTime).getTime() || 0));
+      return merged;
+    });
 
     if (meta?.fxRates && Object.keys(meta.fxRates).length > 0) {
       setFxRates((prev) => ({ ...prev, ...meta.fxRates }));
@@ -418,23 +447,12 @@ export default function App() {
       setNetDepositsBase(meta.netDepositsBase);
       if (detectedBaseCurrency) setEndingCashCurrency(detectedBaseCurrency);
     }
+    if (meta?.cashByCurrency && Object.keys(meta.cashByCurrency).length > 0) {
+      setCashByCurrency(meta.cashByCurrency);
+    }
     if (detectedBaseCurrency) {
       setBaseCurrency(detectedBaseCurrency);
     }
-  };
-
-  const handleLoadDemo = () => {
-    const demo = getDemoPortfolioTransactions();
-    setTransactions(demo);
-    setBucketOverrides({});
-    setFxRates({});
-    setPositionMarks({});
-    setEndingCashBase(undefined);
-    setDepositsBase(undefined);
-    setWithdrawalsBase(undefined);
-    setNetDepositsBase(undefined);
-    setIsDemoPortfolio(true);
-    setQuotes({});
   };
 
   const handleClearPortfolio = () => {
@@ -446,7 +464,7 @@ export default function App() {
     setDepositsBase(undefined);
     setWithdrawalsBase(undefined);
     setNetDepositsBase(undefined);
-    setIsDemoPortfolio(false);
+    setCashByCurrency(undefined);
     setQuotes({});
   };
 
@@ -456,6 +474,7 @@ export default function App() {
       depositsBase: cashSummaryInDisplayCurrency?.depositsBase,
       withdrawalsBase: cashSummaryInDisplayCurrency?.withdrawalsBase,
       netDepositsBase: cashSummaryInDisplayCurrency?.netDepositsBase,
+      cashByCurrency,
     });
     const blob = new Blob([jsonStr], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -482,12 +501,12 @@ export default function App() {
         setBucketOverrides(res.bucketOverrides);
         setBaseCurrency(res.baseCurrency);
         setEndingCashCurrency(res.baseCurrency);
-        setIsDemoPortfolio(false);
         setPositionMarks({});
         setEndingCashBase(res.endingCashBase);
         setDepositsBase(res.depositsBase);
         setWithdrawalsBase(res.withdrawalsBase);
         setNetDepositsBase(res.netDepositsBase);
+        setCashByCurrency(res.cashByCurrency);
       } catch (err: any) {
         console.error('Failed reading file:', err.message);
       }
@@ -495,74 +514,50 @@ export default function App() {
     reader.readAsText(file);
   };
 
-  // Build ticker tape symbols from active positions & open standalone options
-  const tapeTickers = useMemo(() => {
-    const syms = new Set<string>();
-    portfolioState.positions.forEach((p) => syms.add(p.ticker));
-    portfolioState.standalonePositions
-      .filter((s) => s.status === 'OPEN')
-      .forEach((s) => syms.add(s.underlying));
-    return Array.from(syms).slice(0, 8);
-  }, [portfolioState.positions, portfolioState.standalonePositions]);
+  const activeTickers = useMemo(
+    () => portfolioState.unifiedTickers.filter((t) => t.isActive),
+    [portfolioState.unifiedTickers]
+  );
+
+  const tapeTickers = useMemo(
+    () => activeTickers.map((t) => t.ticker).slice(0, 8),
+    [activeTickers]
+  );
 
   return (
     <div className="min-h-screen bg-[#080d14] text-[#e2e8f0] flex flex-col font-sans selection:bg-emerald-500/30 selection:text-emerald-300">
-      {/* 1. Header */}
+      {/* 1. Header & Compact Spot Tape */}
       <Header
         baseCurrency={baseCurrency}
         onToggleCurrency={handleToggleCurrency}
         onRefreshQuotes={refreshQuotes}
         isRefreshing={isRefreshingQuotes}
-        onLoadDemo={handleLoadDemo}
         onOpenImport={() => setActiveTab('LEDGER')}
         onExportJson={handleExportJson}
         quotes={quotes}
         tapeTickers={tapeTickers}
         positions={portfolioState.positions}
+        unifiedTickers={portfolioState.unifiedTickers}
         positionMarks={positionMarks}
       />
 
-      {/* 2. Main Navigation Tabs (4 Tabs) */}
+      {/* 2. Clean 2-Tab Navigation Bar */}
       <div className="bg-[#0a111b] border-b border-[#182638] px-4 sm:px-6 lg:px-8">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
-          <nav className="flex space-x-1 sm:space-x-2 py-2 overflow-x-auto">
+          <nav className="flex space-x-2 py-2 overflow-x-auto">
             <button
-              onClick={() => setActiveTab('OVERVIEW')}
+              onClick={() => setActiveTab('PORTFOLIO')}
               className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-mono font-medium transition-all ${
-                activeTab === 'OVERVIEW'
+                activeTab === 'PORTFOLIO'
                   ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/40 shadow-sm font-bold'
                   : 'text-slate-400 hover:text-slate-200 hover:bg-[#121f31] border border-transparent'
               }`}
             >
-              <LayoutDashboard className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Overview</span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('POSITIONS')}
-              className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-mono font-medium transition-all ${
-                activeTab === 'POSITIONS'
-                  ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/40 shadow-sm font-bold'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-[#121f31] border border-transparent'
-              }`}
-            >
-              <Layers className="w-3.5 h-3.5 text-cyan-400" />
-              <span>Positions &amp; Campaigns</span>
+              <LayoutGrid className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Portfolio Matrix</span>
               <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-[#16273c] text-slate-300">
-                {portfolioState.positions.length}
+                {activeTickers.length}
               </span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('ANALYTICS')}
-              className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-mono font-medium transition-all ${
-                activeTab === 'ANALYTICS'
-                  ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/40 shadow-sm font-bold'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-[#121f31] border border-transparent'
-              }`}
-            >
-              <LineChart className="w-3.5 h-3.5 text-purple-400" />
-              <span>Analytics</span>
             </button>
 
             <button
@@ -573,7 +568,7 @@ export default function App() {
                   : 'text-slate-400 hover:text-slate-200 hover:bg-[#121f31] border border-transparent'
               }`}
             >
-              <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
+              <FileSpreadsheet className="w-3.5 h-3.5 text-cyan-400" />
               <span>Trade Ledger &amp; Import</span>
               <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-[#16273c] text-slate-300">
                 {transactions.length}
@@ -582,11 +577,6 @@ export default function App() {
           </nav>
 
           <div className="hidden md:flex items-center gap-3 text-xs font-mono text-slate-400">
-            {isDemoPortfolio && (
-              <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                DEMO PORTFOLIO
-              </span>
-            )}
             <span className="flex items-center gap-1.5">
               <span className="w-2 h-2 rounded-full bg-emerald-400" />
               <span>2-Bucket Engine:</span>
@@ -598,62 +588,52 @@ export default function App() {
         </div>
       </div>
 
-      {/* 3. Customizable Metric & View Visibility Bar */}
-      <VisibilityBar visibility={visibility} onChange={setVisibility} activeTab={activeTab} />
+      {/* 3. Main Content Body */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-5">
+        {activeTab === 'PORTFOLIO' ? (
+          <>
+            {/* Always-Visible Reconciled 5-KPI Command Strip */}
+            {transactions.length > 0 && (
+              <TopKpiStrip
+                summary={portfolioState.summary}
+                cashSummary={cashSummaryInDisplayCurrency}
+                endingCashBase={endingCashInDisplayCurrency}
+                allocation={allocation}
+                baseCurrency={baseCurrency}
+                activeTickerCount={activeTickers.length}
+                totalTickerCount={portfolioState.unifiedTickers.length}
+              />
+            )}
 
-      {/* 4. Tab Content Body */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        {activeTab === 'OVERVIEW' && (
-          <OverviewTab
-            summary={portfolioState.summary}
-            positions={portfolioState.positions}
-            standalonePositions={portfolioState.standalonePositions}
-            visibility={visibility}
-            baseCurrency={baseCurrency}
-            fxRates={fxRates}
-            endingCashBase={endingCashInDisplayCurrency}
-            cashSummary={cashSummaryInDisplayCurrency}
-            onNavigateToPositions={() => setActiveTab('POSITIONS')}
-          />
-        )}
+            {/* Primary Unified Ticker Matrix + Expandable Campaign Comparison */}
+            <UnifiedTickerMatrix
+              tickers={portfolioState.unifiedTickers}
+              baseCurrency={baseCurrency}
+              panels={optionalPanels}
+              onChangePanels={setOptionalPanels}
+              onToggleCampaignBucket={handleToggleCampaignBucket}
+              onToggleBucket={handleToggleBucket}
+              onOpenImport={() => setActiveTab('LEDGER')}
+            />
 
-        {activeTab === 'POSITIONS' && (
-          <PositionsTab
-            positions={portfolioState.positions}
-            closedPositions={portfolioState.closedPositions}
-            standalonePositions={portfolioState.standalonePositions}
-            bucketOverrides={bucketOverrides}
-            onToggleBucket={handleToggleBucket}
-            onToggleCampaignBucket={handleToggleCampaignBucket}
-            baseCurrency={baseCurrency}
-            fxRates={fxRates}
-            visibility={visibility}
-          />
-        )}
-
-        {activeTab === 'ANALYTICS' && (
-          <AnalyticsTab
-            summary={portfolioState.summary}
-            positions={portfolioState.positions}
-            standalonePositions={portfolioState.standalonePositions}
-            transactions={transactions}
-            quotes={quotes}
-            fxRates={fxRates}
-            positionMarks={positionMarks}
-            endingCashBase={endingCashInDisplayCurrency}
-            netDepositsBase={cashSummaryInDisplayCurrency?.netDepositsBase}
-            baseCurrency={baseCurrency}
-            visibility={visibility}
-          />
-        )}
-
-        {activeTab === 'LEDGER' && (
+            {/* Optional Deep-Dive Panels (All OFF by Default) */}
+            <OptionalDeepDivePanels
+              panels={optionalPanels}
+              positions={portfolioState.positions}
+              closedPositions={portfolioState.closedPositions}
+              standalonePositions={portfolioState.standalonePositions}
+              transactions={transactions}
+              quotes={quotes}
+              fxRates={fxRates}
+              positionMarks={positionMarks}
+              baseCurrency={baseCurrency}
+            />
+          </>
+        ) : (
           <LedgerImportTab
             transactions={transactions}
-            isDemoPortfolio={isDemoPortfolio}
             onImportTransactions={handleImportTransactions}
             onClearPortfolio={handleClearPortfolio}
-            onLoadDemo={handleLoadDemo}
             onExportJson={handleExportJson}
             onImportJsonFile={handleImportJsonFile}
             bucketOverrides={bucketOverrides}
@@ -663,9 +643,9 @@ export default function App() {
         )}
       </main>
 
-      {/* 5. Minimalist Footer */}
+      {/* 4. Minimalist Footer */}
       <footer className="border-t border-[#142030] bg-[#070c14] py-3 text-center text-xs font-mono text-slate-500">
-        APEX // Portfolio Performance Tracker • Chronological Real Entry Price Engine • Interactive Brokers Flex XML / CSV Native
+        APEX // Unified Ticker Portfolio Tracker • Chronological Real Entry Price Engine • IBKR Flex XML / CSV Native
       </footer>
     </div>
   );

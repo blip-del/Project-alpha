@@ -2,7 +2,6 @@ import React, { useState, useRef } from 'react';
 import {
   Upload,
   Download,
-  Sparkles,
   Trash2,
   Search,
   Filter,
@@ -23,7 +22,6 @@ import { parseUniversalIBKRInput, AI_EXTRACTION_PROMPT } from '../utils/ibkrPars
 
 interface LedgerImportTabProps {
   transactions: Transaction[];
-  isDemoPortfolio?: boolean;
   onImportTransactions: (
     newTransactions: Transaction[],
     baseCurrency?: 'EUR' | 'USD',
@@ -34,11 +32,10 @@ interface LedgerImportTabProps {
       depositsBase?: number;
       withdrawalsBase?: number;
       netDepositsBase?: number;
-      replaceDemo?: boolean;
+      cashByCurrency?: Record<string, number>;
     }
   ) => void;
   onClearPortfolio: () => void;
-  onLoadDemo: () => void;
   onExportJson: () => void;
   onImportJsonFile: (file: File) => void;
   bucketOverrides: Record<string, BucketType>;
@@ -48,10 +45,8 @@ interface LedgerImportTabProps {
 
 export const LedgerImportTab: React.FC<LedgerImportTabProps> = ({
   transactions,
-  isDemoPortfolio = false,
   onImportTransactions,
   onClearPortfolio,
-  onLoadDemo,
   onExportJson,
   onImportJsonFile,
   bucketOverrides,
@@ -81,7 +76,7 @@ export const LedgerImportTab: React.FC<LedgerImportTabProps> = ({
       return;
     }
 
-    const existingIds = isDemoPortfolio ? new Set<string>() : new Set(transactions.map((t) => t.id));
+    const existingIds = new Set(transactions.map((t) => t.id));
     const res = parseUniversalIBKRInput(text, existingIds);
 
     if (res.errors.length > 0 && res.transactions.length === 0) {
@@ -103,10 +98,10 @@ export const LedgerImportTab: React.FC<LedgerImportTabProps> = ({
       depositsBase: res.depositsBase,
       withdrawalsBase: res.withdrawalsBase,
       netDepositsBase: res.netDepositsBase,
-      replaceDemo: isDemoPortfolio,
+      cashByCurrency: res.cashByCurrency,
     });
     setImportNotice(
-      `✅ [${res.format}] ${isDemoPortfolio ? 'Replaced demo with' : 'Imported'} ${res.transactions.length} transactions (${res.duplicatesSkipped} duplicates skipped). Sections: ${res.sectionsFound.slice(0, 4).join(', ')}.`
+      `✅ [${res.format}] Imported ${res.transactions.length} transactions (${res.duplicatesSkipped} duplicates skipped). Sections: ${res.sectionsFound.slice(0, 4).join(', ')}.`
     );
   };
 
@@ -277,19 +272,10 @@ export const LedgerImportTab: React.FC<LedgerImportTabProps> = ({
               Portfolio State &amp; Backups
             </h4>
             <p className="text-[11px] text-slate-400 font-mono mb-3">
-              Export full portfolio with bucket overrides, or load sample multi-year data.
+              Export your full portfolio with bucket overrides or restore a saved JSON backup.
             </p>
 
             <div className="space-y-2">
-              {/* Load Demo */}
-              <button
-                onClick={onLoadDemo}
-                className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-300 text-xs font-mono transition-colors font-semibold shadow-sm"
-              >
-                <Sparkles className="w-4 h-4 text-emerald-400" />
-                <span>Load Demo Multi-Year Portfolio</span>
-              </button>
-
               {/* Export JSON */}
               <button
                 onClick={onExportJson}
@@ -447,7 +433,15 @@ export const LedgerImportTab: React.FC<LedgerImportTabProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-[#131f2f]">
-              {filtered.map((tx) => {
+              {filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={10} className="py-10 text-center text-slate-400 font-mono text-xs">
+                    {transactions.length === 0
+                      ? 'No transactions loaded yet. Upload an IBKR Flex XML, Activity CSV, or JSON statement above to initialize your ledger.'
+                      : 'No transactions match the current search or filter criteria.'}
+                  </td>
+                </tr>
+              ) : filtered.map((tx) => {
                 const isLinked = tx.bucket === 'LINKED';
                 const isOption = tx.assetCategory === 'OPT';
 

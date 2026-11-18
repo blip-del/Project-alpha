@@ -21,73 +21,9 @@ import {
   AdvancedKPIs,
   PositionMark,
 } from '../types';
-import { getFxMultiplier, calculateDownsideCushionPct } from './portfolioEngine';
+import { getFxMultiplier, calculateDownsideCushionPct, calculateXIRR } from './portfolioEngine';
 
-/**
- * Newton-Raphson XIRR implementation
- * cashFlows: { date: 'YYYY-MM-DD', amount: negative for outflows/buys, positive for inflows/sales/dividends/terminal value }
- */
-export function calculateXIRR(cashFlows: Array<{ date: string; amount: number }>): number {
-  if (cashFlows.length < 2) return 0;
-
-  const sorted = cashFlows
-    .filter((cf) => Math.abs(cf.amount) > 0.0001)
-    .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-
-  if (sorted.length < 2) return 0;
-
-  const hasPositive = sorted.some((cf) => cf.amount > 0);
-  const hasNegative = sorted.some((cf) => cf.amount < 0);
-  if (!hasPositive || !hasNegative) return 0;
-
-  const d0 = new Date(sorted[0].date).getTime();
-  const yearFractions = sorted.map((cf) => {
-    const dt = new Date(cf.date).getTime();
-    return Math.max(0, (dt - d0) / (86400000 * 365));
-  });
-
-  const f = (r: number): number => {
-    let sum = 0;
-    for (let i = 0; i < sorted.length; i++) {
-      const frac = yearFractions[i];
-      const base = 1 + r;
-      if (base <= 0) return 1e9;
-      sum += sorted[i].amount / Math.pow(base, frac);
-    }
-    return sum;
-  };
-
-  const df = (r: number): number => {
-    let sum = 0;
-    for (let i = 0; i < sorted.length; i++) {
-      const frac = yearFractions[i];
-      const base = 1 + r;
-      if (base <= 0) return -1e9;
-      sum -= (frac * sorted[i].amount) / Math.pow(base, frac + 1);
-    }
-    return sum;
-  };
-
-  let r = 0.12;
-  const maxIterations = 60;
-  const tolerance = 1e-6;
-
-  for (let iter = 0; iter < maxIterations; iter++) {
-    const y = f(r);
-    const dy = df(r);
-    if (Math.abs(dy) < 1e-12) break;
-
-    const nextR = r - y / dy;
-    if (isNaN(nextR) || !isFinite(nextR)) break;
-
-    if (Math.abs(nextR - r) < tolerance) {
-      return Number((nextR * 100).toFixed(2));
-    }
-    r = Math.max(-0.99, Math.min(10.0, nextR));
-  }
-
-  return Number((r * 100).toFixed(2));
-}
+export { calculateXIRR };
 
 export interface StepDownPoint {
   date: string;
@@ -115,10 +51,9 @@ export function computeStepDownData(
   position.timeline.forEach((step, idx) => {
     const stepProgress = idx / Math.max(1, position.timeline.length - 1);
     const baseSpot = step.rawAvgCostAfter + (liveSpot - position.rawAvgEntry) * stepProgress;
-    const estimatedSpot = Number(Math.max(0.01, baseSpot).toFixed(2));
 
     const savingPerShare = Math.max(0, step.rawAvgCostAfter - step.realEntryPriceAfter);
-    const currentCushion = calculateDownsideCushionPct(estimatedSpot, step.realEntryPriceAfter);
+    const currentCushion = calculateDownsideCushionPct(baseSpot, step.realEntryPriceAfter);
 
     const fmtPrice = (v: number) => (v > 0 && v < 2 ? v.toFixed(3) : v.toFixed(2));
     let eventSummary = step.actionDesc;
@@ -184,7 +119,6 @@ export function computeMonthlyCashflows(
 } {
   const map = new Map<string, { divs: number; premiums: number; standalone: number }>();
 
-  // Track closed standalone cashflows properly
   transactions.forEach((tx) => {
     const monthKey = (tx.date || tx.dateTime || '').slice(0, 7);
     if (!monthKey || monthKey.length !== 7 || !/^\d{4}-\d{2}$/.test(monthKey)) return;
@@ -202,7 +136,6 @@ export function computeMonthlyCashflows(
       if (tx.bucket === 'LINKED') {
         cur.premiums += tx.netCashFlow * fx;
       } else {
-        // Only count realized P&L on standalone options (avoids counting open LEAP buys as losses)
         if (tx.realizedPnl !== undefined && tx.realizedPnl !== 0) {
           cur.standalone += tx.realizedPnl * fx;
         }
@@ -241,7 +174,7 @@ export function computeMonthlyCashflows(
       label,
       netDividends: netDivs,
       linkedPremiums: netPrems,
-      standalonePnl: standalonePnl,
+      standalonePnl,
       totalInflow: total,
     });
   });
@@ -262,7 +195,8 @@ export function computeMonthlyCashflows(
 }
 
 /**
- * Extract Active Open Options metrics (DTE, Cushion %, % Profit Captured, Extrinsic Value, APR)
+ * Extract Active Open Options metrics (DTE, Strike Cushion %, % Profit Captured, Extrinsic Value, APR, Unrealized P&L)
+ * Accurate OTM/ITM math for both Short & Long Calls/Puts — deep-OTM short calls are never mislabeled TESTED.
  */
 export function computeActiveOptions(
   positions: StockPosition[],
@@ -270,13 +204,15 @@ export function computeActiveOptions(
   quotes: Record<string, StockQuote> = {},
   positionMarks: Record<string, PositionMark> = {},
   baseCurrency: 'EUR' | 'USD' = 'EUR',
-  fxRates: Record<string, number> = {}
+  fxRates: Record<string, number> = {},
+  closedPositions: StockPosition[] = []
 ): ActiveOptionMetric[] {
   const activeMetrics: ActiveOptionMetric[] = [];
   const now = new Date();
+  const allStockContainers = [...positions, ...closedPositions];
 
-  const getSpotForUnderlying = (underlying: string, _currency: string, fallbackStrike: number): number => {
-    const pos = positions.find((p) => p.ticker === underlying);
+  const getSpotForUnderlying = (underlying: string, fallbackStrike: number): number => {
+    const pos = allStockContainers.find((p) => p.ticker === underlying && p.spotPrice > 0);
     if (pos && pos.spotPrice > 0) return pos.spotPrice;
     if (positionMarks[underlying]?.markPrice) return positionMarks[underlying].markPrice;
     const q = quotes[underlying];
@@ -284,9 +220,9 @@ export function computeActiveOptions(
     return fallbackStrike;
   };
 
-  // 1. Linked Covered Calls and Short Options from active positions
-  positions.forEach((p) => {
-    const spot = p.spotPrice || getSpotForUnderlying(p.ticker, p.currency, 0);
+  // 1. Linked Covered Calls and Short/Linked Options (across active & zero-share underlyings)
+  allStockContainers.forEach((p) => {
+    const spot = p.spotPrice || getSpotForUnderlying(p.ticker, 0);
 
     p.linkedOptionCampaigns.forEach((camp) => {
       if (camp.status !== 'OPEN' || camp.netContracts === 0) return;
@@ -300,51 +236,88 @@ export function computeActiveOptions(
       const fx = getFxMultiplier(camp.currency, baseCurrency, fxRates);
 
       let cushionPct = 0;
-      if (camp.type === 'CALL') {
-        cushionPct = spot > 0 ? ((camp.strike - spot) / spot) * 100 : 0;
-      } else {
-        cushionPct = spot > 0 ? ((spot - camp.strike) / spot) * 100 : 0;
+      if (spot > 0 && camp.strike > 0) {
+        if (isShort) {
+          cushionPct =
+            camp.type === 'CALL'
+              ? ((camp.strike - spot) / spot) * 100
+              : ((spot - camp.strike) / spot) * 100;
+        } else {
+          cushionPct =
+            camp.type === 'CALL'
+              ? ((spot - camp.strike) / spot) * 100
+              : ((camp.strike - spot) / spot) * 100;
+        }
       }
 
       const mark = positionMarks[camp.contractSymbol];
-      const openCreditBasis = mark && mark.costBasisMoney !== 0
-        ? Math.abs(mark.costBasisMoney) / numContracts / mult
-        : camp.totalCredits > 0
-        ? camp.totalCredits / Math.max(1, camp.trades.filter((t) => t.quantity < 0).reduce((s, t) => s + Math.abs(t.quantity), 0)) / mult
-        : 0;
-      const originalPremium = openCreditBasis;
-      const markPriceVal = mark?.markPrice ?? Number((originalPremium * Math.min(1, Math.max(0.1, dte / 60))).toFixed(2));
+      const openCostBasis =
+        camp.openCostBasis !== undefined && camp.openCostBasis !== 0
+          ? Math.abs(camp.openCostBasis)
+          : mark && mark.costBasisMoney !== 0
+          ? Math.abs(mark.costBasisMoney)
+          : camp.totalCredits;
 
-      const profitCapturedPct = originalPremium > 0
-        ? Math.max(-200, Math.min(100, Math.round(((originalPremium - markPriceVal) / originalPremium) * 100)))
-        : 0;
+      const avgEntryPrice =
+        openCostBasis > 0
+          ? openCostBasis / numContracts / mult
+          : camp.totalCredits > 0
+          ? camp.totalCredits /
+            Math.max(1, camp.trades.filter((t) => t.quantity < 0).reduce((s, t) => s + Math.abs(t.quantity), 0)) /
+            mult
+          : 0;
+
+      const markPriceVal =
+        camp.currentMarkPrice ??
+        mark?.markPrice ??
+        Number((avgEntryPrice * Math.min(1, Math.max(0.1, dte / 60))).toFixed(2));
+
+      const profitCapturedPct =
+        avgEntryPrice > 0
+          ? isShort
+            ? Math.max(-300, Math.min(100, Math.round(((avgEntryPrice - markPriceVal) / avgEntryPrice) * 100)))
+            : Math.max(-100, Math.min(500, Math.round(((markPriceVal - avgEntryPrice) / avgEntryPrice) * 100)))
+          : 0;
+
+      const unrealizedPnlNative =
+        camp.unrealizedPnl !== undefined
+          ? camp.unrealizedPnl
+          : isShort
+          ? (avgEntryPrice - markPriceVal) * numContracts * mult
+          : (markPriceVal - avgEntryPrice) * numContracts * mult;
+      const unrealizedPnlBase = unrealizedPnlNative * fx;
 
       const intrinsicPerShare =
-        camp.type === 'CALL'
-          ? Math.max(0, spot - camp.strike)
-          : Math.max(0, camp.strike - spot);
+        camp.type === 'CALL' ? Math.max(0, spot - camp.strike) : Math.max(0, camp.strike - spot);
       const extrinsicPerShare = Math.max(0, markPriceVal - intrinsicPerShare);
       const extrinsicRemaining = Number((extrinsicPerShare * numContracts * mult * fx).toFixed(2));
       const thetaPerDay = dte > 0 ? Number((extrinsicRemaining / dte).toFixed(2)) : 0;
 
-      const openCreditDollars = originalPremium * numContracts * mult;
-      const collateral = (p.currentShares > 0 ? Math.max(0.01, p.realEntryPrice) : camp.strike) * numContracts * mult;
-      const annualizedApr = collateral > 0 && dte > 0
-        ? Number((((openCreditDollars / collateral) * 365) / dte * 100).toFixed(1))
-        : 0;
+      const openCreditDollars = avgEntryPrice * numContracts * mult;
+      const collateral = (p.currentShares > 0 && p.realEntryPrice > 0 ? p.realEntryPrice : camp.strike) * numContracts * mult;
+      const annualizedApr =
+        collateral > 0 && dte > 0 && isShort
+          ? Number((((openCreditDollars / collateral) * 365) / dte * 100).toFixed(1))
+          : 0;
 
       let statusTag: ActiveOptionMetric['statusTag'] = 'ACTIVE';
       let statusLabel = `${dte}d to expiry`;
 
-      if (profitCapturedPct >= 70) {
+      if (isShort && cushionPct < 5) {
+        statusTag = 'TESTED';
+        statusLabel = cushionPct < 0 ? `ITM / Tested (${cushionPct.toFixed(1)}%)` : `Near Strike (+${cushionPct.toFixed(1)}%)`;
+      } else if (isShort && profitCapturedPct >= 70) {
         statusTag = 'ROLL_CANDIDATE';
         statusLabel = `Roll Candidate (${profitCapturedPct}% captured)`;
-      } else if (dte >= 14 && dte <= 45) {
-        statusTag = 'SWEET_SPOT';
-        statusLabel = `Optimal Decay Zone (${dte}d)`;
       } else if (dte < 14) {
         statusTag = 'EXPIRING_SOON';
         statusLabel = `Expiring Soon (${dte}d left)`;
+      } else if (dte >= 14 && dte <= 45) {
+        statusTag = 'SWEET_SPOT';
+        statusLabel = `Optimal Decay (${dte}d)`;
+      } else if (isShort && profitCapturedPct < 0 && cushionPct >= 5) {
+        statusTag = 'ACTIVE';
+        statusLabel = `OTM (+${cushionPct.toFixed(0)}%) • Mark Up`;
       }
 
       activeMetrics.push({
@@ -358,8 +331,10 @@ export function computeActiveOptions(
         expiry: camp.expiry,
         dte,
         contracts: numContracts,
-        entryPrice: Number(originalPremium.toFixed(2)),
+        entryPrice: Number(avgEntryPrice.toFixed(2)),
         currentPrice: Number(markPriceVal.toFixed(2)),
+        unrealizedPnlNative,
+        unrealizedPnlBase,
         strikeCushionPct: Number(cushionPct.toFixed(1)),
         profitCapturedPct,
         extrinsicRemaining,
@@ -376,7 +351,7 @@ export function computeActiveOptions(
   // 2. Open Standalone Options (Bucket B)
   standalonePositions.forEach((sp) => {
     if (sp.status === 'OPEN' && sp.netContracts !== 0) {
-      const spot = getSpotForUnderlying(sp.underlying, sp.currency, sp.strike);
+      const spot = getSpotForUnderlying(sp.underlying, sp.strike);
       const expiryDate = new Date(sp.expiry);
       const diffMs = expiryDate.getTime() - now.getTime();
       const dte = Math.max(1, Math.round(diffMs / 86400000));
@@ -386,22 +361,45 @@ export function computeActiveOptions(
 
       const isLong = sp.netContracts > 0;
       const currentMark = sp.currentMarkPrice;
-      const pnlPct = sp.avgEntryPrice > 0
-        ? isLong
-          ? Math.round(((currentMark - sp.avgEntryPrice) / sp.avgEntryPrice) * 100)
-          : Math.round(((sp.avgEntryPrice - currentMark) / sp.avgEntryPrice) * 100)
-        : 0;
+      const pnlPct =
+        sp.avgEntryPrice > 0
+          ? isLong
+            ? Math.round(((currentMark - sp.avgEntryPrice) / sp.avgEntryPrice) * 100)
+            : Math.round(((sp.avgEntryPrice - currentMark) / sp.avgEntryPrice) * 100)
+          : 0;
 
       const intrinsicPerShare =
-        sp.type === 'CALL'
-          ? Math.max(0, spot - sp.strike)
-          : Math.max(0, sp.strike - spot);
+        sp.type === 'CALL' ? Math.max(0, spot - sp.strike) : Math.max(0, sp.strike - spot);
       const extrinsicPerShare = Math.max(0, currentMark - intrinsicPerShare);
       const extrinsicVal = Number((extrinsicPerShare * numContracts * mult * fx).toFixed(2));
-      const cushionPct =
-        sp.type === 'CALL'
-          ? spot > 0 ? ((sp.strike - spot) / spot) * 100 : 0
-          : spot > 0 ? ((spot - sp.strike) / spot) * 100 : 0;
+
+      let cushionPct = 0;
+      if (spot > 0 && sp.strike > 0) {
+        if (isLong) {
+          cushionPct =
+            sp.type === 'CALL'
+              ? ((spot - sp.strike) / spot) * 100
+              : ((sp.strike - spot) / spot) * 100;
+        } else {
+          cushionPct =
+            sp.type === 'CALL'
+              ? ((sp.strike - spot) / spot) * 100
+              : ((spot - sp.strike) / spot) * 100;
+        }
+      }
+
+      let statusTag: ActiveOptionMetric['statusTag'] = 'ACTIVE';
+      let statusLabel = `${isLong ? 'Long' : 'Short'} ${sp.type} (${dte}d)`;
+      if (!isLong && cushionPct < 5) {
+        statusTag = 'TESTED';
+        statusLabel = cushionPct < 0 ? `ITM / Tested (${cushionPct.toFixed(1)}%)` : `Near Strike (+${cushionPct.toFixed(1)}%)`;
+      } else if (dte < 14) {
+        statusTag = 'EXPIRING_SOON';
+        statusLabel = `Expiring Soon (${dte}d left)`;
+      } else if (!isLong && pnlPct >= 70) {
+        statusTag = 'ROLL_CANDIDATE';
+        statusLabel = `Roll Candidate (${pnlPct}% captured)`;
+      }
 
       activeMetrics.push({
         id: sp.id,
@@ -416,13 +414,15 @@ export function computeActiveOptions(
         contracts: numContracts,
         entryPrice: Number(sp.avgEntryPrice.toFixed(2)),
         currentPrice: Number(currentMark.toFixed(2)),
+        unrealizedPnlNative: sp.unrealizedPnl,
+        unrealizedPnlBase: sp.unrealizedPnl * fx,
         strikeCushionPct: Number(cushionPct.toFixed(1)),
-        profitCapturedPct: Math.max(0, Math.min(100, pnlPct)),
+        profitCapturedPct: pnlPct,
         extrinsicRemaining: extrinsicVal,
         annualizedApr: 0,
         thetaPerDay: dte > 0 ? Number((extrinsicVal / dte).toFixed(2)) : 0,
-        statusTag: 'ACTIVE',
-        statusLabel: `${isLong ? 'Long' : 'Short'} ${sp.type} (${dte}d)`,
+        statusTag,
+        statusLabel,
         bucket: 'STANDALONE',
         currency: sp.currency,
       });
@@ -434,20 +434,27 @@ export function computeActiveOptions(
 }
 
 /**
- * Capital Allocation across Equity, Cash Collateral, Standalone Options, and Cash Buffer (in baseCurrency)
+ * Reconciled Capital Allocation & Currency Buckets (FX Exposure)
+ * Decomposes 100% of Net Liq Value (Equities MV + Open Options Net MV + Available Cash by Currency)
+ * into USD Bucket vs EUR Bucket in Base Reporting Currency.
  */
 export function computeCapitalAllocation(
   positions: StockPosition[],
   standalonePositions: StandaloneOptionPosition[],
-  transactions: Transaction[],
+  _transactions: Transaction[],
   baseCurrency: 'EUR' | 'USD' = 'EUR',
   fxRates: Record<string, number> = {},
-  endingCashBase?: number
+  endingCashBase?: number,
+  cashByCurrency?: Record<string, number>,
+  closedPositions: StockPosition[] = []
 ): CapitalAllocation {
   let usdAmount = 0;
   let eurAmount = 0;
-
   let equityValue = 0;
+  let cashCollateral = 0;
+  let openOptionsNetValue = 0;
+
+  // 1. Active Equities Market Value
   positions.forEach((p) => {
     const fx = getFxMultiplier(p.currency, baseCurrency, fxRates);
     const valBase = p.marketValue * fx;
@@ -456,45 +463,63 @@ export function computeCapitalAllocation(
     else usdAmount += valBase;
   });
 
-  // Cash Collateral for open CSPs
-  let cashCollateral = 0;
-  positions.forEach((p) => {
+  // 2. Open Linked Options Net Market Value & Short Put Collateral
+  [...positions, ...closedPositions].forEach((p) => {
     p.linkedOptionCampaigns.forEach((camp) => {
-      if (camp.status === 'OPEN' && camp.type === 'PUT' && camp.netContracts < 0) {
+      if (camp.status === 'OPEN' && camp.netContracts !== 0) {
         const fx = getFxMultiplier(camp.currency, baseCurrency, fxRates);
-        const col = camp.strike * (camp.multiplier || 100) * Math.abs(camp.netContracts) * fx;
-        cashCollateral += col;
-        if (camp.currency === 'EUR') eurAmount += col;
-        else usdAmount += col;
+        const mvBase = (camp.marketValue || 0) * fx;
+        openOptionsNetValue += mvBase;
+        if (camp.currency === 'EUR') eurAmount += mvBase;
+        else usdAmount += mvBase;
+
+        if (camp.type === 'PUT' && camp.netContracts < 0) {
+          cashCollateral += camp.strike * (camp.multiplier || 100) * Math.abs(camp.netContracts) * fx;
+        }
       }
     });
   });
 
-  // Standalone open options current market value (or open cost)
+  // 3. Open Standalone Options Net Market Value
   let standaloneOptionsValue = 0;
   standalonePositions.forEach((sp) => {
-    if (sp.status === 'OPEN') {
+    if (sp.status === 'OPEN' && sp.netContracts !== 0) {
       const fx = getFxMultiplier(sp.currency, baseCurrency, fxRates);
-      const val = Math.max(0, sp.marketValue) * fx;
-      standaloneOptionsValue += val;
-      if (sp.currency === 'EUR') eurAmount += val;
-      else usdAmount += val;
+      const mvBase = sp.marketValue * fx;
+      standaloneOptionsValue += mvBase;
+      openOptionsNetValue += mvBase;
+      if (sp.currency === 'EUR') eurAmount += mvBase;
+      else usdAmount += mvBase;
+
+      if (sp.type === 'PUT' && sp.netContracts < 0) {
+        cashCollateral += sp.strike * (sp.multiplier || 100) * Math.abs(sp.netContracts) * fx;
+      }
     }
   });
 
-  const freeCashBuffer =
-    endingCashBase !== undefined && endingCashBase >= 0
-      ? Math.round(endingCashBase)
-      : Math.round(equityValue * 0.12);
+  // 4. Cash Buffer broken down by currency bucket
+  let freeCashBuffer = 0;
+  const hasPerCurrencyCash = cashByCurrency && Object.keys(cashByCurrency).length > 0;
+  if (hasPerCurrencyCash) {
+    let cashSumBase = 0;
+    for (const [cur, amt] of Object.entries(cashByCurrency!)) {
+      const amtBase = amt * getFxMultiplier(cur, baseCurrency, fxRates);
+      cashSumBase += amtBase;
+      if (cur.toUpperCase() === 'EUR') eurAmount += amtBase;
+      else usdAmount += amtBase;
+    }
+    freeCashBuffer = cashSumBase;
+  } else if (endingCashBase !== undefined) {
+    freeCashBuffer = endingCashBase;
+    if (baseCurrency === 'EUR') eurAmount += freeCashBuffer;
+    else usdAmount += freeCashBuffer;
+  }
 
-  if (baseCurrency === 'EUR') eurAmount += freeCashBuffer;
-  else usdAmount += freeCashBuffer;
-
-  const totalCapital = Math.max(1, equityValue + cashCollateral + standaloneOptionsValue + freeCashBuffer);
-  const totalCur = Math.max(1, usdAmount + eurAmount);
-
-  const usdPercent = Number(((usdAmount / totalCur) * 100).toFixed(1));
-  const eurPercent = Number(((eurAmount / totalCur) * 100).toFixed(1));
+  const totalCapital = equityValue + openOptionsNetValue + freeCashBuffer;
+  const totalCur = usdAmount + eurAmount;
+  const usdPercent = totalCur > 0 ? Number(((usdAmount / totalCur) * 100).toFixed(1)) : 0;
+  const eurPercent = totalCur > 0 ? Number((100 - usdPercent).toFixed(1)) : 0;
+  const usdToEurRate = getFxMultiplier('USD', 'EUR', fxRates);
 
   return {
     equityValue,
@@ -506,6 +531,7 @@ export function computeCapitalAllocation(
     eurAmount,
     usdPercent,
     eurPercent,
+    usdToEurRate,
   };
 }
 
@@ -546,19 +572,17 @@ export function computeAdvancedKPIs(
     .filter((tx) => tx.assetCategory === 'OPT' && tx.netCashFlow > 0 && tx.bucket === 'LINKED')
     .reduce((sum, tx) => sum + tx.netCashFlow * getFxMultiplier(tx.currency, baseCurrency, fxRates, tx.fxRateToBase), 0);
 
-  const returnOnMarginPct = totalRawCostBasis > 0
-    ? Number((((totalCredits / totalRawCostBasis)) * 100).toFixed(1))
-    : 0;
+  const returnOnMarginPct =
+    totalRawCostBasis > 0 ? Number(((totalCredits / totalRawCostBasis) * 100).toFixed(1)) : 0;
 
   const shortOptions = activeOptions.filter((o) => o.action === 'SHORT' && o.annualizedApr > 0);
-  const annualizedAprPct = shortOptions.length > 0
-    ? Number((shortOptions.reduce((acc, opt) => acc + opt.annualizedApr, 0) / shortOptions.length).toFixed(1))
-    : 0;
+  const annualizedAprPct =
+    shortOptions.length > 0
+      ? Number((shortOptions.reduce((acc, opt) => acc + opt.annualizedApr, 0) / shortOptions.length).toFixed(1))
+      : 0;
 
   const dailyThetaDollars = Math.round(
-    activeOptions
-      .filter((o) => o.action === 'SHORT')
-      .reduce((acc, opt) => acc + opt.thetaPerDay, 0)
+    activeOptions.filter((o) => o.action === 'SHORT').reduce((acc, opt) => acc + opt.thetaPerDay, 0)
   );
 
   const netGainDollars = totalMarketValue - totalRawCostBasis;
@@ -572,3 +596,4 @@ export function computeAdvancedKPIs(
     netGainDollars,
   };
 }
+

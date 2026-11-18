@@ -7,23 +7,20 @@ import {
   Database,
   ShieldCheck,
   Globe,
-  SlidersHorizontal,
-  ChevronRight,
-  Sparkles,
 } from 'lucide-react';
-import { StockQuote, StockPosition, PositionMark } from '../types';
+import { StockQuote, StockPosition, PositionMark, UnifiedTickerSummary } from '../types';
 
 interface HeaderProps {
   baseCurrency: 'EUR' | 'USD';
   onToggleCurrency: () => void;
   onRefreshQuotes: () => void;
   isRefreshing: boolean;
-  onLoadDemo: () => void;
   onOpenImport: () => void;
   onExportJson: () => void;
   quotes: Record<string, StockQuote>;
   tapeTickers?: string[];
   positions?: StockPosition[];
+  unifiedTickers?: UnifiedTickerSummary[];
   positionMarks?: Record<string, PositionMark>;
 }
 
@@ -32,18 +29,18 @@ export const Header: React.FC<HeaderProps> = ({
   onToggleCurrency,
   onRefreshQuotes,
   isRefreshing,
-  onLoadDemo,
   onOpenImport,
   onExportJson,
   quotes,
   tapeTickers = [],
   positions = [],
+  unifiedTickers = [],
   positionMarks = {},
 }) => {
-  const displayTickers = tapeTickers.length > 0 ? tapeTickers : Object.keys(quotes).slice(0, 6);
+  const displayTickers = tapeTickers.length > 0 ? tapeTickers : Object.keys(quotes).slice(0, 8);
 
   return (
-    <header className="border-b border-[#1c2838] bg-[#090f18]/90 backdrop-blur sticky top-0 z-40">
+    <header className="border-b border-[#1c2838] bg-[#090f18]">
       {/* Top Banner */}
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-wrap items-center justify-between gap-4">
         {/* Brand & Subtitle */}
@@ -57,7 +54,7 @@ export const Header: React.FC<HeaderProps> = ({
                 APEX <span className="text-emerald-400 font-mono">//</span> CHRONO-TRACKER
               </span>
               <span className="text-[10px] font-mono font-semibold px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-                REAL BASIS ENGINE
+                UNIFIED BASIS ENGINE
               </span>
             </div>
             <p className="text-xs text-slate-400 font-mono hidden sm:block">
@@ -90,16 +87,6 @@ export const Header: React.FC<HeaderProps> = ({
             <span className="hidden sm:inline">Refresh</span>
           </button>
 
-          {/* Load Demo Portfolio */}
-          <button
-            onClick={onLoadDemo}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 text-xs font-mono text-emerald-300 transition-colors"
-            title="Load realistic multi-year sample IBKR portfolio"
-          >
-            <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Load Demo</span>
-          </button>
-
           {/* Import CSV/XML */}
           <button
             onClick={onOpenImport}
@@ -129,14 +116,15 @@ export const Header: React.FC<HeaderProps> = ({
         </span>
         <div className="flex items-center gap-6 shrink-0">
           {displayTickers.map((sym) => {
+            const ut = unifiedTickers.find((u) => u.ticker === sym);
             const pos = positions.find((p) => p.ticker === sym);
             const mark = positionMarks[sym];
             const q = quotes[sym];
-            const cur = pos?.currency || mark?.currency || 'USD';
+            const cur = ut?.currency || pos?.currency || mark?.currency || 'USD';
             const curSym = cur === 'EUR' ? '€' : '$';
-            const price = pos?.spotPrice || q?.regularMarketPrice || mark?.markPrice || 0;
-            const change = pos ? pos.spotChange : q?.regularMarketChange || 0;
-            const changePct = pos ? pos.spotChangePct : q?.regularMarketChangePercent || 0;
+            const price = ut?.spotPrice || pos?.spotPrice || q?.regularMarketPrice || mark?.markPrice || 0;
+            const change = ut ? ut.spotChange : pos ? pos.spotChange : q?.regularMarketChange || 0;
+            const changePct = ut ? ut.spotChangePct : pos ? pos.spotChangePct : q?.regularMarketChangePercent || 0;
             const isPos = change >= 0;
 
             return (
