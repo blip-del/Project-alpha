@@ -3,7 +3,16 @@
  * Offline-capable client-side parser and SHA-like deduplication engine.
  */
 
-import { Transaction, AssetCategory, TradeAction, BucketType, OptionDetails, PositionMark } from '../types';
+import {
+  Transaction,
+  AssetCategory,
+  TradeAction,
+  BucketType,
+  OptionDetails,
+  PositionMark,
+  CashTransferEvent,
+  StatementSnapshotMeta,
+} from '../types';
 
 /**
  * Normalize IBKR date strings (DD/MM/YYYY;HHMMSS, YYYYMMDD;HHMMSS, YYYY-MM-DD;HHMMSS) -> YYYY-MM-DD HH:mm:ss or YYYY-MM-DD
@@ -592,15 +601,22 @@ export function exportPortfolioToJson(
     withdrawalsBase?: number;
     netDepositsBase?: number;
     cashByCurrency?: Record<string, number>;
-  }
+  },
+  journalBackup?: {
+    overrides?: Record<string, any>;
+    settings?: any;
+  },
+  lastStatementMeta?: StatementSnapshotMeta
 ): string {
   const exportPayload = {
-    version: '1.0.0',
+    version: '1.2.0',
     app: 'Options Analyzer Terminal - Portfolio Performance Tracker',
     exportDate: new Date().toISOString(),
     baseCurrency,
     bucketOverrides,
     cashSummary,
+    journalBackup,
+    lastStatementMeta,
     transactionCount: transactions.length,
     transactions,
   };
@@ -762,6 +778,10 @@ export function parseIBKRFlexXML(
   withdrawalsBase?: number;
   netDepositsBase?: number;
   cashByCurrency?: Record<string, number>;
+  statementFromDate?: string;
+  statementToDate?: string;
+  whenGenerated?: string;
+  cashTransfers?: CashTransferEvent[];
   errors: string[];
 } {
   const transactions: Transaction[] = [];
@@ -775,6 +795,10 @@ export function parseIBKRFlexXML(
   let withdrawalsBase: number | undefined;
   let netDepositsBase: number | undefined;
   const cashByCurrency: Record<string, number> = {};
+  let statementFromDate: string | undefined;
+  let statementToDate: string | undefined;
+  let whenGenerated: string | undefined;
+  const cashTransfers: CashTransferEvent[] = [];
   const errors: string[] = [];
 
   try {
@@ -791,6 +815,24 @@ export function parseIBKRFlexXML(
         positionMarks,
         errors: ['Invalid XML format: ' + parseErr.textContent?.slice(0, 120)],
       };
+    }
+
+    // Extract FlexStatement / FlexQueryResponse period metadata for date-aware snapshot guards
+    const flexStmt = doc.querySelector('FlexStatement');
+    const flexResp = doc.querySelector('FlexQueryResponse');
+    const rawFrom = flexStmt?.getAttribute('fromDate') || '';
+    const rawTo = flexStmt?.getAttribute('toDate') || '';
+    const rawGen = flexStmt?.getAttribute('whenGenerated') || flexResp?.getAttribute('whenGenerated') || '';
+    if (rawFrom) {
+      const norm = normalizeIBKRDate(rawFrom).slice(0, 10);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(norm)) statementFromDate = norm;
+    }
+    if (rawTo) {
+      const norm = normalizeIBKRDate(rawTo).slice(0, 10);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(norm)) statementToDate = norm;
+    }
+    if (rawGen) {
+      whenGenerated = normalizeIBKRDate(rawGen);
     }
 
     // Detect base currency from AccountInformation
@@ -1034,6 +1076,26 @@ export function parseIBKRFlexXML(
       const fxRate = resolveFx(currency, dateOnly, node.getAttribute('fxRateToBase'));
       const txId = node.getAttribute('transactionID') || '';
 
+      const isTransfer =
+        typeAttr.includes('deposits/withdrawals') ||
+        typeAttr.includes('deposit') ||
+        typeAttr.includes('withdrawal') ||
+        typeAttr.includes('electronic fund transfer');
+      if (isTransfer && amount !== 0) {
+        const transferId =
+          txId ||
+          generateTransactionHash(dateTime, `XFER_${currency}`, 1, Math.abs(amount), desc.slice(0, 24));
+        cashTransfers.push({
+          id: transferId,
+          date: dateOnly,
+          amountBase: amount * fxRate,
+          currency,
+          description: desc || undefined,
+        });
+        sectionsFound.add('Deposits & Withdrawals (XML)');
+        continue;
+      }
+
       const isTax = typeAttr.includes('withholding tax') || typeAttr.includes('tax');
       const isDiv = typeAttr.includes('dividend') || typeAttr.includes('payment in lieu');
       if ((!isTax && !isDiv) || amount === 0) continue;
@@ -1237,6 +1299,10 @@ export function parseIBKRFlexXML(
     withdrawalsBase,
     netDepositsBase,
     cashByCurrency: Object.keys(cashByCurrency).length > 0 ? cashByCurrency : undefined,
+    statementFromDate,
+    statementToDate,
+    whenGenerated,
+    cashTransfers: cashTransfers.length > 0 ? cashTransfers : undefined,
     errors,
   };
 }
@@ -1256,6 +1322,11 @@ export function importPortfolioFromJson(
   withdrawalsBase?: number;
   netDepositsBase?: number;
   cashByCurrency?: Record<string, number>;
+  journalBackup?: {
+    overrides?: Record<string, any>;
+    settings?: any;
+  };
+  lastStatementMeta?: StatementSnapshotMeta;
   duplicatesSkipped: number;
   error?: string;
 } {
@@ -1301,6 +1372,8 @@ export function importPortfolioFromJson(
       withdrawalsBase: cashSummary?.withdrawalsBase,
       netDepositsBase: cashSummary?.netDepositsBase,
       cashByCurrency: cashSummary?.cashByCurrency,
+      journalBackup: !Array.isArray(parsed) ? parsed.journalBackup : undefined,
+      lastStatementMeta: !Array.isArray(parsed) ? parsed.lastStatementMeta : undefined,
       duplicatesSkipped,
     };
   } catch (err: any) {
@@ -1331,6 +1404,15 @@ export function parseUniversalIBKRInput(
   withdrawalsBase?: number;
   netDepositsBase?: number;
   cashByCurrency?: Record<string, number>;
+  statementFromDate?: string;
+  statementToDate?: string;
+  whenGenerated?: string;
+  cashTransfers?: CashTransferEvent[];
+  journalBackup?: {
+    overrides?: Record<string, any>;
+    settings?: any;
+  };
+  lastStatementMeta?: StatementSnapshotMeta;
   duplicatesSkipped: number;
   sectionsFound: string[];
   baseCurrency: 'EUR' | 'USD';
@@ -1351,6 +1433,8 @@ export function parseUniversalIBKRInput(
       withdrawalsBase: res.withdrawalsBase,
       netDepositsBase: res.netDepositsBase,
       cashByCurrency: res.cashByCurrency,
+      journalBackup: res.journalBackup,
+      lastStatementMeta: res.lastStatementMeta,
       duplicatesSkipped: res.duplicatesSkipped,
       sectionsFound: ['JSON Import'],
       baseCurrency: res.baseCurrency,

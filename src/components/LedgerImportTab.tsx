@@ -16,42 +16,54 @@ import {
   Copy,
   Check,
   ClipboardPaste,
+  RotateCcw,
+  Calendar,
+  BookOpen,
+  ShieldAlert,
 } from 'lucide-react';
-import { Transaction, AssetCategory, BucketType, PositionMark } from '../types';
+import {
+  Transaction,
+  BucketType,
+  StatementSnapshotMeta,
+  ImportMergeDiff,
+} from '../types';
 import { parseUniversalIBKRInput, AI_EXTRACTION_PROMPT } from '../utils/ibkrParser';
+import { ParsedImportPayload } from '../utils/xmlImportEngine';
 
 interface LedgerImportTabProps {
   transactions: Transaction[];
-  onImportTransactions: (
-    newTransactions: Transaction[],
-    baseCurrency?: 'EUR' | 'USD',
-    meta?: {
-      fxRates?: Record<string, number>;
-      positionMarks?: Record<string, PositionMark>;
-      endingCashBase?: number;
-      depositsBase?: number;
-      withdrawalsBase?: number;
-      netDepositsBase?: number;
-      cashByCurrency?: Record<string, number>;
-    }
-  ) => void;
+  onMergeImport: (payload: ParsedImportPayload, sourceLabel: string) => ImportMergeDiff;
   onClearPortfolio: () => void;
   onExportJson: () => void;
   onImportJsonFile: (file: File) => void;
   bucketOverrides: Record<string, BucketType>;
   onToggleBucket: (transactionId: string) => void;
   baseCurrency: 'EUR' | 'USD';
+  lastStatementMeta?: StatementSnapshotMeta;
+  lastImportDiff: ImportMergeDiff | null;
+  onDismissImportDiff: () => void;
+  canUndoImport: boolean;
+  onUndoLastImport: () => void;
+  journalOverrideCount: number;
+  onOpenJournalClosedTrade: (tradeId: string) => void;
 }
 
 export const LedgerImportTab: React.FC<LedgerImportTabProps> = ({
   transactions,
-  onImportTransactions,
+  onMergeImport,
   onClearPortfolio,
   onExportJson,
   onImportJsonFile,
   bucketOverrides,
   onToggleBucket,
   baseCurrency,
+  lastStatementMeta,
+  lastImportDiff,
+  onDismissImportDiff,
+  canUndoImport,
+  onUndoLastImport,
+  journalOverrideCount,
+  onOpenJournalClosedTrade,
 }) => {
   const [dragActive, setDragActive] = useState(false);
   const [importNotice, setImportNotice] = useState<string | null>(null);
@@ -66,42 +78,57 @@ export const LedgerImportTab: React.FC<LedgerImportTabProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLInputElement>(null);
 
-  const currencySymbol = baseCurrency === 'EUR' ? '€' : '$';
-
   const [confirmClear, setConfirmClear] = useState(false);
 
   const processRawText = (text: string, sourceLabel: string) => {
     if (!text || !text.trim()) {
-      setImportNotice('⚠️ Input is empty.');
+      setImportNotice('Input is empty.');
       return;
     }
 
-    const existingIds = new Set(transactions.map((t) => t.id));
-    const res = parseUniversalIBKRInput(text, existingIds);
+    // Parse full incoming file (without pre-filtering existing IDs) so the merge engine can
+    // upsert richer broker metadata, deduplicate cross-source dividends, and compute exact diffs.
+    const res = parseUniversalIBKRInput(text, new Set());
 
     if (res.errors.length > 0 && res.transactions.length === 0) {
-      setImportNotice(`❌ Error parsing ${res.format} (${sourceLabel}): ${res.errors[0]}`);
+      setImportNotice(`Error parsing ${res.format} (${sourceLabel}): ${res.errors[0]}`);
       return;
     }
 
-    if (res.transactions.length === 0 && res.duplicatesSkipped === 0) {
+    const hasSnapshotData =
+      (res.positionMarks && Object.keys(res.positionMarks).length > 0) ||
+      res.endingCashBase !== undefined;
+
+    if (res.transactions.length === 0 && !hasSnapshotData) {
       setImportNotice(
-        `⚠️ No eligible transactions found in ${res.format} (${sourceLabel}). Check that Trades, Dividends, or JSON transactions are included.`
+        `No eligible transactions found in ${res.format} (${sourceLabel}). Check that Trades, Dividends, or JSON transactions are included.`
       );
       return;
     }
 
-    onImportTransactions(res.transactions, res.baseCurrency, {
-      fxRates: res.fxRates,
-      positionMarks: res.positionMarks,
-      endingCashBase: res.endingCashBase,
-      depositsBase: res.depositsBase,
-      withdrawalsBase: res.withdrawalsBase,
-      netDepositsBase: res.netDepositsBase,
-      cashByCurrency: res.cashByCurrency,
-    });
-    setImportNotice(
-      `✅ [${res.format}] Imported ${res.transactions.length} transactions (${res.duplicatesSkipped} duplicates skipped). Sections: ${res.sectionsFound.slice(0, 4).join(', ')}.`
+    setImportNotice(null);
+    onMergeImport(
+      {
+        format: res.format,
+        transactions: res.transactions,
+        bucketOverrides: res.bucketOverrides,
+        fxRates: res.fxRates,
+        positionMarks: res.positionMarks,
+        endingCashBase: res.endingCashBase,
+        depositsBase: res.depositsBase,
+        withdrawalsBase: res.withdrawalsBase,
+        netDepositsBase: res.netDepositsBase,
+        cashByCurrency: res.cashByCurrency,
+        statementFromDate: res.statementFromDate,
+        statementToDate: res.statementToDate,
+        whenGenerated: res.whenGenerated,
+        cashTransfers: res.cashTransfers,
+        journalBackup: res.journalBackup,
+        lastStatementMeta: res.lastStatementMeta,
+        sectionsFound: res.sectionsFound,
+        baseCurrency: res.baseCurrency,
+      },
+      sourceLabel
     );
   };
 
@@ -187,6 +214,7 @@ export const LedgerImportTab: React.FC<LedgerImportTabProps> = ({
               onChange={(e) => {
                 if (e.target.files && e.target.files[0]) {
                   handleStatementFile(e.target.files[0]);
+                  e.target.value = '';
                 }
               }}
             />
@@ -294,6 +322,7 @@ export const LedgerImportTab: React.FC<LedgerImportTabProps> = ({
                 onChange={(e) => {
                   if (e.target.files && e.target.files[0]) {
                     onImportJsonFile(e.target.files[0]);
+                    e.target.value = '';
                   }
                 }}
               />
@@ -304,6 +333,30 @@ export const LedgerImportTab: React.FC<LedgerImportTabProps> = ({
                 <FileCode className="w-4 h-4 text-purple-400" />
                 <span>Restore JSON Backup</span>
               </button>
+            </div>
+
+            {/* Snapshot & Manual Overlay Protection Status */}
+            <div className="mt-3 pt-3 border-t border-[#182638] space-y-1.5 text-[11px] font-mono">
+              <div className="flex items-center justify-between text-slate-400">
+                <span className="flex items-center gap-1.5">
+                  <Calendar className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>Last Snapshot</span>
+                </span>
+                <span className="text-slate-200">
+                  {lastStatementMeta?.toDate
+                    ? `${lastStatementMeta.fromDate ? `${lastStatementMeta.fromDate} → ` : ''}${lastStatementMeta.toDate}`
+                    : 'Not recorded'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-slate-400">
+                <span className="flex items-center gap-1.5">
+                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Manual Overlay</span>
+                </span>
+                <span className="text-emerald-300">
+                  {journalOverrideCount} journal · {Object.keys(bucketOverrides).length} buckets
+                </span>
+              </div>
             </div>
           </div>
 
@@ -330,11 +383,147 @@ export const LedgerImportTab: React.FC<LedgerImportTabProps> = ({
         </div>
       </div>
 
-      {/* Notice alert */}
+      {/* Structured Import Diff & Safety Report (with 1-click Undo) */}
+      {lastImportDiff && (
+        <div
+          data-testid="import-diff-report"
+          className="bg-[#0b1624] border border-emerald-500/35 rounded-xl p-4 space-y-3 animate-in fade-in duration-150"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+              <div>
+                <div className="text-xs font-mono font-bold text-white flex flex-wrap items-center gap-2">
+                  <span>
+                    [{lastImportDiff.format}] Safe Merge Complete — {lastImportDiff.sourceLabel}
+                  </span>
+                  {lastImportDiff.statementToDate && (
+                    <span className="text-[10px] font-normal px-1.5 py-0.5 rounded bg-[#132338] border border-[#213854] text-cyan-300">
+                      {lastImportDiff.statementFromDate
+                        ? `${lastImportDiff.statementFromDate} → ${lastImportDiff.statementToDate}`
+                        : `As of ${lastImportDiff.statementToDate}`}
+                    </span>
+                  )}
+                </div>
+                <p className="text-[11px] font-mono text-slate-400 mt-0.5">
+                  Manual journal theses, stops, lessons, and bucket toggles were preserved under stable trade-cycle IDs.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              {canUndoImport && (
+                <button
+                  onClick={() => {
+                    onUndoLastImport();
+                    setImportNotice('Last import undone — restored exact pre-import ledger, cash snapshot, and manual overrides.');
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-xs font-mono font-semibold text-amber-200 transition-colors"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Undo Last Import</span>
+                </button>
+              )}
+              <button
+                onClick={onDismissImportDiff}
+                className="px-2.5 py-1.5 rounded-md bg-[#0f1d2e] hover:bg-[#16273d] border border-[#1f334d] text-slate-400 hover:text-white text-xs font-mono transition-colors"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+
+          {/* Reconciled Diff Counters */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
+            <div className="bg-[#08101a] border border-[#19283b] rounded-md px-3 py-2">
+              <div className="text-[10px] text-slate-500 uppercase">New Trades</div>
+              <div className="text-sm font-bold text-emerald-400">
+                +{lastImportDiff.newTransactionsCount}
+              </div>
+            </div>
+            <div className="bg-[#08101a] border border-[#19283b] rounded-md px-3 py-2">
+              <div className="text-[10px] text-slate-500 uppercase">Duplicates Skipped</div>
+              <div className="text-sm font-bold text-slate-200">
+                {lastImportDiff.duplicatesSkipped}
+                {lastImportDiff.crossSourceDividendsSkipped > 0 && (
+                  <span className="text-[10px] font-normal text-cyan-300 ml-1.5">
+                    (+{lastImportDiff.crossSourceDividendsSkipped} cross-src div)
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="bg-[#08101a] border border-[#19283b] rounded-md px-3 py-2">
+              <div className="text-[10px] text-slate-500 uppercase">Broker Fields Enriched</div>
+              <div className="text-sm font-bold text-cyan-300">
+                {lastImportDiff.enrichedUpdatedCount}
+              </div>
+            </div>
+            <div className="bg-[#08101a] border border-[#19283b] rounded-md px-3 py-2">
+              <div className="text-[10px] text-slate-500 uppercase">Manual Entries Protected</div>
+              <div className="text-sm font-bold text-emerald-300">
+                {lastImportDiff.manualOverridesPreserved}
+                {lastImportDiff.staleManualPricesCleared > 0 && (
+                  <span className="text-[10px] font-normal text-slate-400 ml-1.5">
+                    ({lastImportDiff.staleManualPricesCleared} stale price cleared)
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Snapshot & Partial-Period Guardrail Callouts */}
+          {(lastImportDiff.snapshotGuardReason || lastImportDiff.depositsPreservedReason) && (
+            <div className="space-y-1.5">
+              {lastImportDiff.snapshotGuardReason && (
+                <div className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/35 rounded-md px-3 py-2 text-xs font-mono text-amber-200">
+                  <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <span>{lastImportDiff.snapshotGuardReason}</span>
+                </div>
+              )}
+              {lastImportDiff.depositsPreservedReason && (
+                <div className="flex items-start gap-2 bg-cyan-500/10 border border-cyan-500/35 rounded-md px-3 py-2 text-xs font-mono text-cyan-200">
+                  <ShieldCheck className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
+                  <span>{lastImportDiff.depositsPreservedReason}</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Newly Closed Trades needing Exit Reason & Lesson */}
+          {lastImportDiff.newlyClosedTrades.length > 0 && (
+            <div className="bg-[#08101a] border border-[#1c2e45] rounded-md p-3 space-y-2">
+              <div className="text-[11px] font-mono font-bold text-slate-200 flex items-center gap-1.5">
+                <BookOpen className="w-3.5 h-3.5 text-amber-400" />
+                <span>
+                  {lastImportDiff.newlyClosedTrades.length} Newly Closed Trade
+                  {lastImportDiff.newlyClosedTrades.length === 1 ? '' : 's'} — Ready for Exit Reason &amp; Lesson
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {lastImportDiff.newlyClosedTrades.map((tr) => (
+                  <button
+                    key={tr.id}
+                    onClick={() => onOpenJournalClosedTrade(tr.id)}
+                    className="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-[#112033] hover:bg-[#182d47] border border-[#243c59] text-xs font-mono text-slate-200 transition-colors"
+                  >
+                    <span className="font-bold text-white">{tr.ticker}</span>
+                    <span className="text-slate-400">{tr.title}</span>
+                    <span className="text-amber-300 font-semibold">
+                      {tr.needsLesson ? 'Log Exit →' : 'View →'}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Simple Warning / Error / Undo Notice */}
       {importNotice && (
         <div className="bg-[#0d1a29] border border-cyan-500/40 rounded-xl p-3.5 flex items-center justify-between text-xs font-mono text-cyan-200 animate-in fade-in">
           <div className="flex items-center gap-2">
-            <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
             <span>{importNotice}</span>
           </div>
           <button

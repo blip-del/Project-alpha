@@ -1,6 +1,13 @@
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
+import { GoogleGenAI, Type } from "@google/genai";
+import {
+  stripSecXsltPrefix,
+  parseForm4Xml,
+  extractPlainTextFromFiling,
+  sanitizeExternalUrl,
+} from "./src/utils/secForm4Parser";
 
 const app = express();
 const PORT = 3000;
@@ -783,9 +790,932 @@ app.get("/api/search", (req, res) => {
   return res.json(filtered);
 });
 
+// ----------------------------------------------------
+// SEC EDGAR FILINGS PROXY (Form 4, 8-K, SC 13D, 10-Q)
+// ----------------------------------------------------
+const SEC_USER_AGENT = "ApexChronoTracker/1.0 (portfolio-journal@apex-tracker.local)";
+const SEC_TICKER_MAP_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const SEC_FILING_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+interface SecCompanyEntry {
+  cikStr: string;
+  title: string;
+}
+
+let secTickerMapCache: { timestamp: number; map: Map<string, SecCompanyEntry> } = {
+  timestamp: 0,
+  map: new Map(),
+};
+
+const secFilingsCache = new Map<string, { timestamp: number; data: any }>();
+const secSupplementalDocsCache = new Map<string, { timestamp: number; docs: Array<{ form: string; filingDate: string; description: string; secUrl: string; rawUrl: string }> }>();
+const secExcerptCache = new Map<string, { timestamp: number; text: string }>();
+const journalIntelCache = new Map<string, { timestamp: number; data: any }>();
+const JOURNAL_INTEL_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const SEC_EXCERPT_CACHE_TTL_MS = 60 * 60 * 1000; // 60 minutes
+
+let cachedGeminiClient: GoogleGenAI | null = null;
+function getGeminiClient(): GoogleGenAI | null {
+  const apiKey = (process.env.GEMINI_API_KEY || "").trim();
+  if (!apiKey) return null;
+  if (!cachedGeminiClient) {
+    cachedGeminiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    });
+  }
+  return cachedGeminiClient;
+}
+
+const TARGET_SEC_FORMS = new Set([
+  "4",
+  "4/A",
+  "8-K",
+  "8-K/A",
+  "SC 13D",
+  "SC 13D/A",
+  "SCHEDULE 13D",
+  "SCHEDULE 13D/A",
+  "10-Q",
+  "10-Q/A",
+  "6-K",
+  "20-F",
+]);
+
+const SUPPLEMENTAL_AI_SEC_FORMS = new Set([
+  "10-K",
+  "10-K/A",
+  "S-3",
+  "S-3/A",
+  "424B5",
+  "F-3",
+]);
+
+const TRIGGER_SEC_FORMS = new Set([
+  "4",
+  "4/A",
+  "8-K",
+  "8-K/A",
+  "SC 13D",
+  "SC 13D/A",
+  "SCHEDULE 13D",
+  "SCHEDULE 13D/A",
+]);
+
+function buildSafeSecArchiveUrl(cikNumeric: string, accNoDash: string, safeDoc: string): string | null {
+  if (!/^\d{1,10}$/.test(cikNumeric) || !/^\d{10,25}$/.test(accNoDash) || !safeDoc) return null;
+  if (safeDoc.includes("..") || safeDoc.startsWith("/") || !/^[A-Za-z0-9._\-\/]+$/.test(safeDoc)) return null;
+  return `https://www.sec.gov/Archives/edgar/data/${cikNumeric}/${accNoDash}/${safeDoc}`;
+}
+
+async function fetchSecDocumentText(secArchiveUrl: string, maxChars = 7500): Promise<string> {
+  if (!secArchiveUrl.startsWith("https://www.sec.gov/Archives/edgar/data/")) return "";
+  const now = Date.now();
+  const cached = secExcerptCache.get(secArchiveUrl);
+  if (cached && now - cached.timestamp < SEC_EXCERPT_CACHE_TTL_MS) {
+    return cached.text.slice(0, maxChars);
+  }
+  try {
+    const res = await fetch(secArchiveUrl, {
+      headers: {
+        "User-Agent": SEC_USER_AGENT,
+        Accept: "text/html,application/xml,text/xml,text/plain;q=0.9,*/*;q=0.8",
+      },
+      signal: AbortSignal.timeout(6500),
+    });
+    if (!res.ok) return "";
+    const raw = await res.text();
+    const cleaned = extractPlainTextFromFiling(raw, 12000);
+    secExcerptCache.set(secArchiveUrl, { timestamp: now, text: cleaned });
+    return cleaned.slice(0, maxChars);
+  } catch {
+    return "";
+  }
+}
+
+async function getSecTickerMap(): Promise<Map<string, SecCompanyEntry>> {
+  const now = Date.now();
+  if (secTickerMapCache.map.size > 0 && now - secTickerMapCache.timestamp < SEC_TICKER_MAP_TTL_MS) {
+    return secTickerMapCache.map;
+  }
+
+  const res = await fetch("https://www.sec.gov/files/company_tickers.json", {
+    headers: {
+      "User-Agent": SEC_USER_AGENT,
+      Accept: "application/json",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`SEC ticker index returned HTTP ${res.status}`);
+  }
+
+  const json = (await res.json()) as Record<string, { cik_str: number | string; ticker: string; title: string }>;
+  const map = new Map<string, SecCompanyEntry>();
+  for (const item of Object.values(json)) {
+    if (!item || !item.ticker || item.cik_str === undefined) continue;
+    const sym = String(item.ticker).toUpperCase().trim();
+    const digits = String(item.cik_str).replace(/\D/g, "");
+    if (!digits) continue;
+    map.set(sym, {
+      cikStr: digits.padStart(10, "0"),
+      title: String(item.title || sym),
+    });
+  }
+
+  secTickerMapCache = { timestamp: now, map };
+  return map;
+}
+
+async function fetchSecTickerSubmissions(ticker: string, forceRefresh = false) {
+  const now = Date.now();
+  const cached = secFilingsCache.get(ticker);
+  if (!forceRefresh && cached && now - cached.timestamp < SEC_FILING_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  const fetchedAt = new Date().toISOString();
+  const tickerMap = await getSecTickerMap();
+  const entry = tickerMap.get(ticker);
+
+  if (!entry || !/^\d{10}$/.test(entry.cikStr)) {
+    const result = {
+      ticker,
+      status: "NO_CIK",
+      fetchedAt,
+      source: "SEC EDGAR",
+      filings: [],
+    };
+    secFilingsCache.set(ticker, { timestamp: now, data: result });
+    return result;
+  }
+
+  const url = `https://data.sec.gov/submissions/CIK${entry.cikStr}.json`;
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": SEC_USER_AGENT,
+      Accept: "application/json",
+    },
+  });
+
+  if (!res.ok) {
+    return {
+      ticker,
+      cik: entry.cikStr,
+      companyName: entry.title,
+      status: "ERROR",
+      error: `SEC submissions returned HTTP ${res.status}`,
+      fetchedAt,
+      source: "SEC EDGAR",
+      filings: [],
+    };
+  }
+
+  const payload = (await res.json()) as any;
+  const recent = payload?.filings?.recent;
+  const forms: string[] = Array.isArray(recent?.form) ? recent.form : [];
+  const filingDates: string[] = Array.isArray(recent?.filingDate) ? recent.filingDate : [];
+  const reportDates: string[] = Array.isArray(recent?.reportDate) ? recent.reportDate : [];
+  const accessionNumbers: string[] = Array.isArray(recent?.accessionNumber) ? recent.accessionNumber : [];
+  const primaryDocs: string[] = Array.isArray(recent?.primaryDocument) ? recent.primaryDocument : [];
+  const primaryDescs: string[] = Array.isArray(recent?.primaryDocDescription) ? recent.primaryDocDescription : [];
+
+  const cikNumeric = String(parseInt(entry.cikStr, 10));
+  const filings: any[] = [];
+  const supplementalDocs: Array<{ form: string; filingDate: string; description: string; secUrl: string; rawUrl: string }> = [];
+  const form4Jobs: Array<{ filingIndex: number; rawXmlUrl: string }> = [];
+  const ninetyDaysAgoMs = now - 90 * 86400000;
+
+  for (let i = 0; i < forms.length && (filings.length < 15 || supplementalDocs.length < 4); i++) {
+    const rawForm = String(forms[i] || "").toUpperCase().trim();
+    const isTarget = TARGET_SEC_FORMS.has(rawForm);
+    const isSupplemental = SUPPLEMENTAL_AI_SEC_FORMS.has(rawForm);
+    if (!isTarget && !isSupplemental) continue;
+
+    const accession = String(accessionNumbers[i] || "").trim();
+    const accNoDash = accession.replace(/[^0-9]/g, "");
+    const rawDoc = String(primaryDocs[i] || "").trim();
+    const safeDoc = rawDoc.replace(/\.\./g, "").replace(/[^A-Za-z0-9._\-\/]/g, "").replace(/^\/+/, "");
+    const secArchiveUrl = buildSafeSecArchiveUrl(cikNumeric, accNoDash, safeDoc);
+    const secUrl = secArchiveUrl || `https://www.sec.gov/edgar/browse/?CIK=${entry.cikStr}`;
+    const filingDateStr = String(filingDates[i] || "");
+
+    if (isTarget && filings.length < 15) {
+      const filingIdx = filings.length;
+      filings.push({
+        form: rawForm,
+        filingDate: filingDateStr,
+        reportDate: String(reportDates[i] || ""),
+        accessionNumber: accession,
+        description: String(primaryDescs[i] || rawForm),
+        secUrl,
+        isTriggerForm: TRIGGER_SEC_FORMS.has(rawForm),
+      });
+
+      // Schedule deterministic Form 4 XML parsing for up to 5 recent Form 4s (within 90 days)
+      if ((rawForm === "4" || rawForm === "4/A") && form4Jobs.length < 5 && safeDoc) {
+        const fMs = new Date(filingDateStr + "T00:00:00Z").getTime();
+        if (!isNaN(fMs) && fMs >= ninetyDaysAgoMs) {
+          const xmlDoc = stripSecXsltPrefix(safeDoc);
+          const rawXmlUrl = buildSafeSecArchiveUrl(cikNumeric, accNoDash, xmlDoc);
+          if (rawXmlUrl && xmlDoc.toLowerCase().endsWith(".xml")) {
+            form4Jobs.push({ filingIndex: filingIdx, rawXmlUrl });
+          }
+        }
+      }
+    } else if (isSupplemental && supplementalDocs.length < 4 && secArchiveUrl) {
+      supplementalDocs.push({
+        form: rawForm,
+        filingDate: filingDateStr,
+        description: String(primaryDescs[i] || rawForm),
+        secUrl,
+        rawUrl: secArchiveUrl,
+      });
+    }
+  }
+
+  // Enrich recent Form 4 filings with deterministic XML transaction codes (Code P vs S vs A/M/F)
+  if (form4Jobs.length > 0) {
+    await Promise.all(
+      form4Jobs.map(async (job) => {
+        try {
+          const xmlRes = await fetch(job.rawXmlUrl, {
+            headers: {
+              "User-Agent": SEC_USER_AGENT,
+              Accept: "application/xml,text/xml;q=0.9,*/*;q=0.8",
+            },
+            signal: AbortSignal.timeout(5000),
+          });
+          if (!xmlRes.ok) return;
+          const xmlText = await xmlRes.text();
+          const summary = parseForm4Xml(xmlText);
+          if (summary) {
+            filings[job.filingIndex].form4Summary = summary;
+          }
+        } catch {
+          // Non-fatal: leave Form 4 without form4Summary if SEC times out
+        }
+      })
+    );
+  }
+
+  secSupplementalDocsCache.set(ticker, { timestamp: now, docs: supplementalDocs });
+
+  const result = {
+    ticker,
+    cik: entry.cikStr,
+    companyName: entry.title,
+    status: "OK",
+    fetchedAt,
+    source: "SEC EDGAR",
+    filings,
+  };
+  secFilingsCache.set(ticker, { timestamp: now, data: result });
+  return result;
+}
+
+app.get("/api/sec-filings", async (req, res) => {
+  try {
+    const rawTickers = String(req.query.tickers || "");
+    const forceRefresh = String(req.query.refresh || "") === "1";
+
+    const tickers = Array.from(
+      new Set(
+        rawTickers
+          .split(",")
+          .map((t) => t.trim().toUpperCase())
+          .filter((t) => /^[A-Z0-9.\-]{1,10}$/.test(t))
+      )
+    ).slice(0, 25);
+
+    if (tickers.length === 0) {
+      return res.status(400).json({ error: "Provide at least one valid ticker symbol" });
+    }
+
+    const results: Record<string, any> = {};
+    // Polite sequential-batched requests (max 4 concurrent) to stay well below SEC's 10 req/sec limit
+    const chunkSize = 4;
+    for (let i = 0; i < tickers.length; i += chunkSize) {
+      const chunk = tickers.slice(i, i + chunkSize);
+      const settled = await Promise.all(
+        chunk.map(async (ticker) => {
+          try {
+            return await fetchSecTickerSubmissions(ticker, forceRefresh);
+          } catch (err: any) {
+            return {
+              ticker,
+              status: "ERROR",
+              error: err?.message || "SEC EDGAR lookup failed",
+              fetchedAt: new Date().toISOString(),
+              source: "SEC EDGAR",
+              filings: [],
+            };
+          }
+        })
+      );
+      for (const item of settled) {
+        results[item.ticker] = item;
+      }
+      if (i + chunkSize < tickers.length) {
+        await new Promise((r) => setTimeout(r, 150));
+      }
+    }
+
+    return res.json({
+      fetchedAt: new Date().toISOString(),
+      source: "SEC EDGAR",
+      filingsByTicker: results,
+    });
+  } catch (error: any) {
+    console.error("API error in /api/sec-filings:", error);
+    return res.status(500).json({ error: error?.message || "Failed to fetch SEC filings" });
+  }
+});
+
+// ----------------------------------------------------
+// AI FILING & NEWS INTELLIGENCE (Server-side Gemini 4)
+// ----------------------------------------------------
+const ALLOWED_CATALYST_TYPES = new Set([
+  "Earnings",
+  "Clinical / FDA",
+  "Insider Cluster",
+  "Activist / 13D",
+  "M&A / Spin-off",
+  "Product / Contract",
+  "Macro / Technical",
+  "Other",
+]);
+
+function extractJsonObject(raw: string): any | null {
+  if (!raw || typeof raw !== "string") return null;
+  let cleaned = raw.trim();
+  const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch && fenceMatch[1]) {
+    cleaned = fenceMatch[1].trim();
+  }
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) return null;
+  try {
+    return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
+  } catch {
+    return null;
+  }
+}
+
+function isIsoDateStr(val: unknown): val is string {
+  return typeof val === "string" && /^\d{4}-\d{2}-\d{2}$/.test(val.trim());
+}
+
+function formatGeminiError(error: any, fallback: string): { statusCode: number; message: string } {
+  let statusCode =
+    typeof error?.status === "number" && error.status >= 400 && error.status < 600
+      ? error.status
+      : 500;
+  let rawMsg = typeof error?.message === "string" ? error.message.trim() : "";
+
+  if (rawMsg.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(rawMsg);
+      const inner = parsed?.error || parsed;
+      if (typeof inner?.code === "number" && inner.code >= 400 && inner.code < 600) {
+        statusCode = inner.code;
+      }
+      if (typeof inner?.message === "string" && inner.message.trim()) {
+        rawMsg = inner.message.trim();
+      }
+    } catch {
+      // keep rawMsg
+    }
+  }
+
+  if (statusCode === 429) {
+    return {
+      statusCode: 429,
+      message: "Gemini API rate/quota limit reached (429). Please wait a moment and click Re-analyze.",
+    };
+  }
+  if (statusCode === 503) {
+    return {
+      statusCode: 503,
+      message: "Gemini model is temporarily busy (503). Please try again in a few seconds.",
+    };
+  }
+  return {
+    statusCode,
+    message: rawMsg ? rawMsg.slice(0, 260) : fallback,
+  };
+}
+
+app.post("/api/journal-intel/analyze-trade", async (req, res) => {
+  try {
+    const ai = getGeminiClient();
+    if (!ai) {
+      return res.status(503).json({
+        error: "Server GEMINI_API_KEY is not configured. Configure GEMINI_API_KEY in the server environment to run AI Filing & News Intelligence.",
+      });
+    }
+
+    const body = req.body || {};
+    const ticker = String(body.ticker || "").trim().toUpperCase();
+    if (!/^[A-Z0-9.\-]{1,10}$/.test(ticker)) {
+      return res.status(400).json({ error: "Invalid ticker symbol" });
+    }
+
+    const companyName = String(body.companyName || ticker).trim().slice(0, 120);
+    const instrument = body.instrument === "OPTION" ? "OPTION" : "STOCK";
+    const status = body.status === "CLOSED" ? "CLOSED" : "OPEN";
+    const entryDate = isIsoDateStr(body.entryDate) ? body.entryDate.trim() : "";
+    const exitDate = isIsoDateStr(body.exitDate) ? body.exitDate.trim() : "";
+    const expiry = isIsoDateStr(body.expiry) ? body.expiry.trim() : "";
+    const catalystDate = isIsoDateStr(body.catalystDate) ? body.catalystDate.trim() : "";
+    const catalystType = String(body.catalystType || "Other").trim().slice(0, 40);
+    const thesis = String(body.thesis || "").trim().slice(0, 500);
+    const manualFilingNote = String(body.manualFilingNote || "").trim().slice(0, 500);
+    const forceRefresh = Boolean(body.forceRefresh);
+
+    const cacheKey = JSON.stringify([
+      ticker,
+      instrument,
+      status,
+      entryDate,
+      exitDate,
+      expiry,
+      catalystType,
+      catalystDate,
+      thesis,
+      manualFilingNote,
+    ]);
+
+    const now = Date.now();
+    const cached = journalIntelCache.get(cacheKey);
+    if (!forceRefresh && cached && now - cached.timestamp < JOURNAL_INTEL_CACHE_TTL_MS) {
+      return res.json({ intel: cached.data, cached: true });
+    }
+
+    // 1. Gather real SEC EDGAR filings + deterministic Form 4 summaries + up to 3 actual SEC filing text excerpts
+    let secData: any = null;
+    try {
+      secData = await fetchSecTickerSubmissions(ticker, forceRefresh);
+    } catch {
+      secData = null;
+    }
+
+    const filings: any[] = Array.isArray(secData?.filings) ? secData.filings : [];
+    const supplementalDocs = secSupplementalDocsCache.get(ticker)?.docs || [];
+
+    const form4SummariesText = filings
+      .filter((f) => (f.form === "4" || f.form === "4/A") && f.form4Summary)
+      .slice(0, 5)
+      .map((f) => {
+        const s = f.form4Summary;
+        return `- Form ${f.form} (${f.filingDate}): ${s.insiderName} (${s.insiderRole}) | ${s.actionLabel} | ${s.shares} shares @ $${s.pricePerShare} (total ~$${s.totalValue}) | openMarketBuy=${s.isOpenMarketBuy} routineNoise=${s.isRoutineNoise} | URL: ${f.secUrl}`;
+      })
+      .join("\n");
+
+    // Pick up to 3 highest-value non-Form-4 filings to extract actual text from sec.gov
+    const docsToRead: Array<{ form: string; filingDate: string; description: string; secUrl: string }> = [];
+    const pickFirst = (pred: (d: any) => boolean, pool: any[]) => {
+      const found = pool.find((d) => pred(d) && d.secUrl?.startsWith("https://www.sec.gov/Archives/edgar/data/") && !docsToRead.some((x) => x.secUrl === d.secUrl));
+      if (found) docsToRead.push({ form: found.form, filingDate: found.filingDate, description: found.description, secUrl: found.secUrl });
+    };
+
+    pickFirst((d) => d.form === "8-K" || d.form === "8-K/A" || d.form === "6-K", filings);
+    pickFirst((d) => d.form === "10-Q" || d.form === "10-Q/A" || d.form === "20-F", filings);
+    pickFirst((d) => d.form.includes("13D"), filings);
+    if (docsToRead.length < 3) {
+      pickFirst((d) => d.form === "S-3" || d.form === "S-3/A" || d.form === "424B5" || d.form === "F-3", supplementalDocs);
+    }
+    if (docsToRead.length < 3) {
+      pickFirst((d) => d.form === "10-K" || d.form === "10-K/A", supplementalDocs);
+    }
+    if (docsToRead.length < 3) {
+      pickFirst((d) => d.form === "8-K" || d.form === "8-K/A", filings);
+    }
+
+    const excerpts = await Promise.all(
+      docsToRead.slice(0, 3).map(async (d) => {
+        const text = await fetchSecDocumentText(d.secUrl, 6500);
+        return { ...d, text };
+      })
+    );
+
+    const secContextBlock = [
+      `SEC Status: ${secData?.status || "UNAVAILABLE"} (${secData?.companyName || companyName}, CIK: ${secData?.cik || "N/A"})`,
+      filings.length > 0
+        ? `Recent SEC Filing List:\n${filings
+            .slice(0, 10)
+            .map((f) => `- ${f.form} | ${f.filingDate} | ${f.description} | ${f.secUrl}`)
+            .join("\n")}`
+        : "No recent US SEC EDGAR filings available (may be non-US issuer).",
+      supplementalDocs.length > 0
+        ? `Recent Shelf / Annual Filings:\n${supplementalDocs
+            .map((d) => `- ${d.form} | ${d.filingDate} | ${d.description} | ${d.secUrl}`)
+            .join("\n")}`
+        : "",
+      form4SummariesText ? `Parsed Form 4 XML Transactions (authoritative):\n${form4SummariesText}` : "",
+      excerpts.filter((e) => e.text).length > 0
+        ? `Actual SEC Filing Text Excerpts:\n${excerpts
+            .filter((e) => e.text)
+            .map((e) => `--- ${e.form} (${e.filingDate}) [${e.secUrl}] ---\n${e.text}`)
+            .join("\n\n")}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    const todayIso = new Date().toISOString().slice(0, 10);
+
+    const systemInstruction = `You are a concise, factual equity & biotech/event-driven filing analyst inside a trader's risk journal.
+Today's date is ${todayIso}.
+Use the provided SEC EDGAR excerpts AND Google Search grounding to verify recent news, earnings dates, FDA/PDUFA/clinical dates, SEC filings, cash runway, ATM/shelf dilution, and (for closed trades) exit-day news.
+Rules:
+1. Never invent dates, cash numbers, or filing facts. If something is unknown or unavailable, say so honestly ("UNKNOWN", null, or empty string).
+2. Keep every field crisp and scannable (1–2 sentences max per summary).
+3. Only output a single valid JSON object matching the exact schema below—no markdown prose outside JSON.
+Schema:
+{
+  "thesisCheck": {
+    "verdict": "ALIGNED" | "WATCH" | "RISK" | "NO_THESIS",
+    "summary": "1-sentence verdict directly addressing the user's thesis",
+    "evidence": "1-2 sentences citing specific recent filing or news facts",
+    "sourceUrl": "optional https:// url"
+  },
+  "filingDigests": [
+    {
+      "form": "8-K | 10-Q | Form 4 | SC 13D | S-3 | News",
+      "date": "YYYY-MM-DD",
+      "materiality": "MATERIAL" | "DILUTION" | "INSIDER_BUY" | "ROUTINE",
+      "headline": "short factual title (max 80 chars)",
+      "summary": "plain-English 1-sentence takeaway",
+      "secUrl": "optional https:// url"
+    }
+  ],
+  "catalystRadar": {
+    "suggestedCatalystType": "Earnings" | "Clinical / FDA" | "Insider Cluster" | "Activist / 13D" | "M&A / Spin-off" | "Product / Contract" | "Macro / Technical" | "Other",
+    "suggestedDate": "YYYY-MM-DD or empty string if no confirmed upcoming date",
+    "eventLabel": "concise description of the next key catalyst (e.g. Q3 Earnings Release or FDA PDUFA Date)",
+    "timelineDrift": "ON_TRACK" | "DELAYED" | "PULLED_FORWARD" | "UNKNOWN",
+    "driftNote": "optional 1-sentence note if timeline shifted vs prior guidance or user date",
+    "sourceUrl": "optional https:// url"
+  },
+  "runwayAndDilution": {
+    "cashAndEquivalents": "e.g. $142M (Q2 2026) or Unknown",
+    "quarterlyBurn": "e.g. ~$18M/qtr or Cash-flow positive or Unknown",
+    "estimatedRunwayMonths": number or null,
+    "dilutionRisk": "LOW" | "MODERATE" | "HIGH" | "UNKNOWN",
+    "atmOrShelfNote": "1-sentence note on active S-3 shelf, ATM facility, warrants, or buybacks/no dilution risk",
+    "asOfDate": "YYYY-MM-DD or quarter label"
+  },
+  "exitContext": ${
+    status === "CLOSED"
+      ? `{
+    "summary": "1-2 sentences explaining what news, filing, or market catalyst happened within +/- 3 days of the exit date",
+    "keyEvents": [{ "date": "YYYY-MM-DD", "headline": "short event headline", "sourceUrl": "optional https:// url" }]
+  }`
+      : "null"
+  }
+}`;
+
+    const userPrompt = `Analyze this journal position and return the JSON object only:
+Ticker: ${ticker}
+Company: ${companyName}
+Instrument: ${instrument}
+Status: ${status}
+Entry Date: ${entryDate || "Unknown"}
+${exitDate ? `Exit Date: ${exitDate}` : ""}
+${expiry ? `Option Expiry: ${expiry}` : ""}
+User's 1. Why I Entered (One-Line Thesis): ${thesis || "(Not entered yet — set verdict to NO_THESIS and still provide filing digests, catalyst radar, and runway/dilution)"}
+User's 2. Catalyst Waiting For: Type=${catalystType}, Date=${catalystDate || "Not set"}
+${manualFilingNote ? `User's Manual Filing/Catalyst Note: ${manualFilingNote}` : ""}
+
+${secContextBlock}
+
+Tasks:
+- Check the user's thesis against the latest SEC filings and current news (via Google Search). Mark verdict "RISK" only when material evidence contradicts the thesis (e.g. FDA CRL/delay, major equity offering dilution, missed endpoint, guidance cut); mark "WATCH" for notable caveats; "ALIGNED" if intact; "NO_THESIS" if thesis is empty.
+- Summarize up to 4 most relevant recent SEC filings in plain English (prioritize 8-K, 10-Q/20-F, SC 13D, S-3/ATM, and open-market Form 4 buys/sales; deprioritize routine grants).
+- Identify the next upcoming catalyst date (YYYY-MM-DD) for ${ticker} and whether any public timeline has been DELAYED vs prior guidance or the user's catalyst date.
+- Extract latest cash & equivalents, quarterly burn / cash-flow status, approximate runway months (or null for profitable/large-cap issuers), dilution risk, and S-3/ATM status.
+${status === "CLOSED" && exitDate ? `- Because this trade is CLOSED on ${exitDate}, search for news/SEC filings within +/- 3 days of ${exitDate} to populate exitContext.` : ""}`;
+
+    let response: any = null;
+    let usedSearchGrounding = true;
+    const isTransientQuotaOrBusy = (err: any) => {
+      const st = err?.status || formatGeminiError(err, "").statusCode;
+      return st === 429 || st === 503;
+    };
+
+    try {
+      response = await ai.models.generateContent({
+        model: "gemini-4-hydrogen",
+        contents: userPrompt,
+        config: {
+          systemInstruction,
+          tools: [{ googleSearch: {} }],
+        },
+      });
+    } catch (primaryErr: any) {
+      if (!isTransientQuotaOrBusy(primaryErr)) throw primaryErr;
+      // Retry with gemini-3.1-flash-lite + Google Search first, then SEC-only if search grounding quota is exhausted
+      try {
+        response = await ai.models.generateContent({
+          model: "gemini-3.1-flash-lite",
+          contents: userPrompt,
+          config: {
+            systemInstruction,
+            tools: [{ googleSearch: {} }],
+          },
+        });
+      } catch (searchErr: any) {
+        if (!isTransientQuotaOrBusy(searchErr)) throw searchErr;
+        usedSearchGrounding = false;
+        response = await ai.models.generateContent({
+          model: "gemini-3.1-flash-lite",
+          contents: userPrompt,
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+          },
+        });
+      }
+    }
+
+    const rawText = response.text || "";
+    const parsed = extractJsonObject(rawText);
+    if (!parsed || typeof parsed !== "object") {
+      return res.status(502).json({
+        error: "AI analyzer returned an unexpected format. Please try re-analyzing.",
+      });
+    }
+
+    // Collect verified sources from grounding chunks + SEC links
+    const sourceMap = new Map<string, { title: string; url: string }>();
+    const addSource = (url?: string, title?: string) => {
+      const safe = sanitizeExternalUrl(url);
+      if (!safe) return;
+      if (!sourceMap.has(safe)) {
+        sourceMap.set(safe, {
+          title: (title || new URL(safe).hostname).slice(0, 90),
+          url: safe,
+        });
+      }
+    };
+
+    const groundingChunks = (response as any)?.candidates?.[0]?.groundingMetadata?.groundingChunks;
+    if (Array.isArray(groundingChunks)) {
+      for (const ch of groundingChunks) {
+        if (ch?.web?.uri) {
+          addSource(ch.web.uri, ch.web.title || ch.web.uri);
+        }
+      }
+    }
+    for (const d of docsToRead) {
+      addSource(d.secUrl, `SEC ${d.form} (${d.filingDate})`);
+    }
+
+    const validVerdicts = new Set(["ALIGNED", "WATCH", "RISK", "NO_THESIS"]);
+    const rawVerdict = String(parsed?.thesisCheck?.verdict || "").toUpperCase();
+    const verdict = !thesis
+      ? "NO_THESIS"
+      : validVerdicts.has(rawVerdict)
+      ? rawVerdict
+      : "WATCH";
+
+    const validMateriality = new Set(["MATERIAL", "DILUTION", "INSIDER_BUY", "ROUTINE"]);
+    const filingDigests = Array.isArray(parsed?.filingDigests)
+      ? parsed.filingDigests.slice(0, 5).map((item: any) => {
+          const mat = String(item?.materiality || "MATERIAL").toUpperCase();
+          const safeUrl = sanitizeExternalUrl(item?.secUrl);
+          if (safeUrl) addSource(safeUrl, `${item?.form || "Filing"} (${item?.date || ""})`);
+          return {
+            form: String(item?.form || "Filing").slice(0, 24),
+            date: String(item?.date || "").slice(0, 20),
+            materiality: validMateriality.has(mat) ? mat : "MATERIAL",
+            headline: String(item?.headline || "").slice(0, 140),
+            summary: String(item?.summary || "").slice(0, 340),
+            secUrl: safeUrl,
+          };
+        })
+      : [];
+
+    const validDrift = new Set(["ON_TRACK", "DELAYED", "PULLED_FORWARD", "UNKNOWN"]);
+    const rawDrift = String(parsed?.catalystRadar?.timelineDrift || "UNKNOWN").toUpperCase();
+    const rawCatType = String(parsed?.catalystRadar?.suggestedCatalystType || "").trim();
+    const suggestedDate = isIsoDateStr(parsed?.catalystRadar?.suggestedDate)
+      ? parsed.catalystRadar.suggestedDate.trim()
+      : undefined;
+    const catalystSourceUrl = sanitizeExternalUrl(parsed?.catalystRadar?.sourceUrl);
+    if (catalystSourceUrl) addSource(catalystSourceUrl, "Catalyst Source");
+
+    const validDilution = new Set(["LOW", "MODERATE", "HIGH", "UNKNOWN"]);
+    const rawDilution = String(parsed?.runwayAndDilution?.dilutionRisk || "UNKNOWN").toUpperCase();
+    const rawRunwayNum = parsed?.runwayAndDilution?.estimatedRunwayMonths;
+    const estimatedRunwayMonths =
+      typeof rawRunwayNum === "number" && isFinite(rawRunwayNum) && rawRunwayNum >= 0 && rawRunwayNum <= 600
+        ? Math.round(rawRunwayNum)
+        : null;
+
+    const thesisSourceUrl = sanitizeExternalUrl(parsed?.thesisCheck?.sourceUrl);
+    if (thesisSourceUrl) addSource(thesisSourceUrl, "Thesis Evidence");
+
+    let exitContext: any = undefined;
+    if (status === "CLOSED" && parsed?.exitContext && typeof parsed.exitContext === "object") {
+      const keyEvents = Array.isArray(parsed.exitContext.keyEvents)
+        ? parsed.exitContext.keyEvents.slice(0, 4).map((ev: any) => {
+            const evUrl = sanitizeExternalUrl(ev?.sourceUrl);
+            if (evUrl) addSource(evUrl, ev?.headline || "Exit Event");
+            return {
+              date: String(ev?.date || exitDate || "").slice(0, 20),
+              headline: String(ev?.headline || "").slice(0, 180),
+              sourceUrl: evUrl,
+            };
+          })
+        : [];
+      exitContext = {
+        summary: String(parsed.exitContext.summary || "").slice(0, 500),
+        keyEvents,
+      };
+    }
+
+    const intel = {
+      ticker,
+      analyzedAt: new Date().toISOString(),
+      source:
+        filings.length > 0 && usedSearchGrounding
+          ? "SEC EDGAR + Gemini Search Grounding"
+          : filings.length > 0
+          ? "SEC EDGAR + Gemini Filing Analysis"
+          : usedSearchGrounding
+          ? "Gemini Search Grounding"
+          : "Gemini Analysis",
+      thesisSnapshot: thesis || undefined,
+      thesisCheck: {
+        verdict,
+        summary: String(parsed?.thesisCheck?.summary || (thesis ? "Review recent filings against thesis." : "Add a one-line thesis to enable automated thesis alignment checks.")).slice(0, 320),
+        evidence: String(parsed?.thesisCheck?.evidence || "").slice(0, 480),
+        sourceUrl: thesisSourceUrl,
+      },
+      filingDigests,
+      catalystRadar: {
+        suggestedCatalystType: ALLOWED_CATALYST_TYPES.has(rawCatType) ? rawCatType : undefined,
+        suggestedDate,
+        eventLabel: String(parsed?.catalystRadar?.eventLabel || "No confirmed upcoming catalyst date found").slice(0, 160),
+        timelineDrift: validDrift.has(rawDrift) ? rawDrift : "UNKNOWN",
+        driftNote: parsed?.catalystRadar?.driftNote ? String(parsed.catalystRadar.driftNote).slice(0, 260) : undefined,
+        sourceUrl: catalystSourceUrl,
+      },
+      runwayAndDilution: {
+        cashAndEquivalents: parsed?.runwayAndDilution?.cashAndEquivalents
+          ? String(parsed.runwayAndDilution.cashAndEquivalents).slice(0, 80)
+          : "Unknown",
+        quarterlyBurn: parsed?.runwayAndDilution?.quarterlyBurn
+          ? String(parsed.runwayAndDilution.quarterlyBurn).slice(0, 80)
+          : "Unknown",
+        estimatedRunwayMonths,
+        dilutionRisk: validDilution.has(rawDilution) ? rawDilution : "UNKNOWN",
+        atmOrShelfNote: String(parsed?.runwayAndDilution?.atmOrShelfNote || "No active shelf/ATM details extracted.").slice(0, 280),
+        asOfDate: parsed?.runwayAndDilution?.asOfDate ? String(parsed.runwayAndDilution.asOfDate).slice(0, 40) : undefined,
+      },
+      exitContext,
+      sources: Array.from(sourceMap.values()).slice(0, 8),
+    };
+
+    journalIntelCache.set(cacheKey, { timestamp: now, data: intel });
+    return res.json({ intel, cached: false });
+  } catch (error: any) {
+    console.error("API error in /api/journal-intel/analyze-trade:", error);
+    const { statusCode, message } = formatGeminiError(
+      error,
+      "Failed to analyze filings & news for this trade."
+    );
+    return res.status(statusCode).json({ error: message });
+  }
+});
+
+app.post("/api/journal-intel/post-mortem", async (req, res) => {
+  try {
+    const ai = getGeminiClient();
+    if (!ai) {
+      return res.status(503).json({
+        error: "Server GEMINI_API_KEY is not configured. Configure GEMINI_API_KEY in the server environment to run AI Post-Mortem Review.",
+      });
+    }
+
+    const rawTrades = req.body?.closedTrades;
+    if (!Array.isArray(rawTrades) || rawTrades.length === 0) {
+      return res.status(400).json({ error: "Provide at least 1 closed trade for post-mortem analysis." });
+    }
+
+    const sanitizedTrades = rawTrades.slice(0, 100).map((t: any) => ({
+      ticker: String(t?.ticker || "").toUpperCase().slice(0, 12),
+      instrument: t?.instrument === "OPTION" ? "OPTION" : "STOCK",
+      catalystType: String(t?.catalystType || "Other").slice(0, 40),
+      holdingDays: typeof t?.holdingDays === "number" && isFinite(t.holdingDays) ? Math.round(t.holdingDays) : 0,
+      currentR: typeof t?.currentR === "number" && isFinite(t.currentR) ? Number(t.currentR.toFixed(2)) : 0,
+      exitReason: String(t?.exitReason || "unlogged").slice(0, 32),
+      thesis: String(t?.thesis || "").slice(0, 240),
+      lesson: String(t?.lesson || "").slice(0, 240),
+      entryDate: String(t?.entryDate || "").slice(0, 12),
+      exitDate: String(t?.exitDate || "").slice(0, 12),
+      hasInsiderCluster: Boolean(t?.hasInsiderCluster),
+    }));
+
+    const sampleCount = sanitizedTrades.length;
+    const postMortemConfig = {
+      systemInstruction: `You are a blunt, quantitative trading performance coach analyzing a trader's closed trades measured in R-multiples.
+- Explicitly respect sample size: if n < 30, mention that conclusions are early directional observations rather than statistically proven edge.
+- Cite concrete tickers, catalyst types, exit reasons, holding periods, and R-multiples from the provided JSON only. Never invent trades.
+- Keep each bullet concise (1-2 sentences, actionable, zero fluff).`,
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          executiveTakeaway: {
+            type: Type.STRING,
+            description: "2-sentence blunt summary of overall R expectancy, win/loss asymmetry, and sample size caveat.",
+          },
+          workingEdges: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: "Up to 4 specific patterns or setups that produced positive R.",
+          },
+          recurringLeaks: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: "Up to 4 specific mistakes, gap slippage, premature exits, or unlogged thesis/exit leaks.",
+          },
+          nextTradeRules: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: "Up to 4 concrete, testable rules to apply on the next 10 trades.",
+          },
+        },
+        required: ["executiveTakeaway", "workingEdges", "recurringLeaks", "nextTradeRules"],
+      },
+    };
+    const postMortemPrompt = `Review these ${sampleCount} closed trades from a trader's 1R risk journal and identify behavioral patterns, edges, leaks, and concrete rules for future trades.\n\nClosed Trades JSON:\n${JSON.stringify(sanitizedTrades)}`;
+
+    let response: any = null;
+    try {
+      response = await ai.models.generateContent({
+        model: "gemini-4-hydrogen",
+        contents: postMortemPrompt,
+        config: postMortemConfig,
+      });
+    } catch (primaryErr: any) {
+      const st = primaryErr?.status || formatGeminiError(primaryErr, "").statusCode;
+      if (st !== 429 && st !== 503) throw primaryErr;
+      response = await ai.models.generateContent({
+        model: "gemini-3.1-flash-lite",
+        contents: postMortemPrompt,
+        config: postMortemConfig,
+      });
+    }
+
+    const parsed = extractJsonObject(response.text || "");
+    if (!parsed) {
+      return res.status(502).json({ error: "AI post-mortem returned an unexpected format. Please retry." });
+    }
+
+    const cleanList = (arr: unknown) =>
+      Array.isArray(arr)
+        ? arr
+            .filter((x) => typeof x === "string" && x.trim().length > 0)
+            .slice(0, 5)
+            .map((x) => String(x).trim().slice(0, 320))
+        : [];
+
+    return res.json({
+      review: {
+        analyzedAt: new Date().toISOString(),
+        closedTradeCount: sampleCount,
+        executiveTakeaway: String(parsed.executiveTakeaway || "").slice(0, 500),
+        workingEdges: cleanList(parsed.workingEdges),
+        recurringLeaks: cleanList(parsed.recurringLeaks),
+        nextTradeRules: cleanList(parsed.nextTradeRules),
+      },
+    });
+  } catch (error: any) {
+    console.error("API error in /api/journal-intel/post-mortem:", error);
+    const { statusCode, message } = formatGeminiError(
+      error,
+      "Failed to generate AI post-mortem review."
+    );
+    return res.status(statusCode).json({ error: message });
+  }
+});
+
 // Clear cache endpoint
 app.post("/api/cache/clear", (_req, res) => {
   optionsCache.clear();
+  secFilingsCache.clear();
+  secSupplementalDocsCache.clear();
+  secExcerptCache.clear();
+  journalIntelCache.clear();
   return res.json({ message: "Cache cleared successfully" });
 });
 

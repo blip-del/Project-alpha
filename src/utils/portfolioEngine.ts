@@ -489,7 +489,7 @@ export function calculatePortfolioState(
 
       // 4. OPTIONS (Bucket A Linked vs Bucket B Standalone)
       else if (tx.assetCategory === 'OPT') {
-        const campaignKey = `${tx.symbol}|${tx.bucket}`;
+        const campaignKey = tx.symbol;
         if (!optionCampaignsMap.has(campaignKey)) {
           optionCampaignsMap.set(campaignKey, []);
         }
@@ -559,119 +559,159 @@ export function calculatePortfolioState(
     let closedOptionsPeakOutlayBase = 0;
     let openOptionCountForTicker = 0;
 
-    for (const [campaignKey, trades] of optionCampaignsMap.entries()) {
-      const contractSymbol = trades[0]?.symbol || campaignKey.split('|')[0];
-      let netContracts = 0;
-      let totalCredits = 0;
-      let totalDebits = 0;
-      let netCashFlow = 0;
-      let ibkrRealizedSum = 0;
-      let hasIbkrRealized = false;
-      let optType: 'CALL' | 'PUT' = 'CALL';
-      let strike = 0;
-      let expiry = '';
-      let bucket: BucketType = trades[0]?.bucket || 'LINKED';
-      const multiplier = trades[0]?.multiplier || 100;
-      const optCurrency = trades[0]?.currency || primaryCurrency;
-      const optFxToBase = getFxMultiplier(optCurrency, baseCurrency, fxRates, trades[0]?.fxRateToBase);
-      const optToStockFx = optCurrency === primaryCurrency ? 1 : optFxToBase / tickerFxToBase;
-
-      for (const tr of trades) {
-        bucket = tr.bucket;
-        netContracts += tr.quantity;
-        if (tr.netCashFlow > 0) totalCredits += tr.netCashFlow;
-        else totalDebits += Math.abs(tr.netCashFlow);
-        netCashFlow += tr.netCashFlow;
-        if (tr.realizedPnl !== undefined && tr.realizedPnl !== 0) {
-          ibkrRealizedSum += tr.realizedPnl;
-          hasIbkrRealized = true;
-        }
-
-        if (tr.optionDetails) {
-          optType = tr.optionDetails.type;
-          strike = tr.optionDetails.strike;
-          expiry = tr.optionDetails.expiry;
+    for (const [contractSymbol, allSymbolTrades] of optionCampaignsMap.entries()) {
+      // Split option trades on the same contract into flat-to-flat cycles so re-entering a contract
+      // creates a clean new cycle and toggling Linked <-> Standalone never alters the campaign ID.
+      const optionCycles: Transaction[][] = [];
+      let activeCycleTrades: Transaction[] = [];
+      let runningCycleNet = 0;
+      for (const tr of allSymbolTrades) {
+        activeCycleTrades.push(tr);
+        runningCycleNet += tr.quantity;
+        if (Math.abs(runningCycleNet) < 1e-6) {
+          runningCycleNet = 0;
+          optionCycles.push(activeCycleTrades);
+          activeCycleTrades = [];
         }
       }
+      if (activeCycleTrades.length > 0) {
+        optionCycles.push(activeCycleTrades);
+      }
 
-      if (Math.abs(netContracts) < 1e-6) netContracts = 0;
-      const isClosed = netContracts === 0;
+      const optDateCounts = new Map<string, number>();
 
-      // Closed option realized P&L is always exact cumulative cash inflow minus outflow (handles IBKR expired options where fifoPnlRealized=0)
-      const realizedPnl = isClosed ? netCashFlow : hasIbkrRealized ? ibkrRealizedSum : 0;
+      for (let cycleIdx = 0; cycleIdx < optionCycles.length; cycleIdx++) {
+        const trades = optionCycles[cycleIdx];
+        const cycleStartDate = trades[0]?.date || trades[0]?.dateTime?.slice(0, 10) || 'unknown';
+        const seq = (optDateCounts.get(cycleStartDate) || 0) + 1;
+        optDateCounts.set(cycleStartDate, seq);
+        const stableCampaignId =
+          seq > 1 ? `opt::${contractSymbol}::${cycleStartDate}::${seq}` : `opt::${contractSymbol}::${cycleStartDate}`;
+        const legacyIds =
+          cycleIdx === 0
+            ? [`camp-${contractSymbol}-LINKED`, `camp-${contractSymbol}-STANDALONE`, `standalone-${contractSymbol}`]
+            : undefined;
 
-      const optMark = positionMarks[contractSymbol];
-      // Open cost basis (signed: positive for Long debit, negative for Short credit)
-      const openCostBasis = isClosed
-        ? 0
-        : optMark && optMark.costBasisMoney !== 0
-        ? optMark.costBasisMoney
-        : -(netCashFlow - realizedPnl);
+        let netContracts = 0;
+        let totalCredits = 0;
+        let totalDebits = 0;
+        let netCashFlow = 0;
+        let ibkrRealizedSum = 0;
+        let hasIbkrRealized = false;
+        let optType: 'CALL' | 'PUT' = 'CALL';
+        let strike = 0;
+        let expiry = '';
+        let linkedCount = 0;
+        let standaloneCount = 0;
+        const multiplier = trades[0]?.multiplier || 100;
+        const optCurrency = trades[0]?.currency || primaryCurrency;
+        const optFxToBase = getFxMultiplier(optCurrency, baseCurrency, fxRates, trades[0]?.fxRateToBase);
+        const optToStockFx = optCurrency === primaryCurrency ? 1 : optFxToBase / tickerFxToBase;
 
-      const avgEntryPerShare =
-        !isClosed && Math.abs(netContracts) > 0
-          ? Math.abs(openCostBasis) / (Math.abs(netContracts) * multiplier)
-          : 0;
+        for (const tr of trades) {
+          if (tr.bucket === 'LINKED') linkedCount++;
+          else standaloneCount++;
+          netContracts += tr.quantity;
+          if (tr.netCashFlow > 0) totalCredits += tr.netCashFlow;
+          else totalDebits += Math.abs(tr.netCashFlow);
+          netCashFlow += tr.netCashFlow;
+          if (tr.realizedPnl !== undefined && tr.realizedPnl !== 0) {
+            ibkrRealizedSum += tr.realizedPnl;
+            hasIbkrRealized = true;
+          }
 
-      const currentMarkPrice = isClosed ? 0 : optMark?.markPrice ?? avgEntryPerShare;
-      const marketValue = isClosed ? 0 : netContracts * currentMarkPrice * multiplier;
-      const unrealizedPnl = isClosed
-        ? 0
-        : optMark
-        ? optMark.fifoPnlUnrealized
-        : marketValue - openCostBasis;
+          if (tr.optionDetails) {
+            optType = tr.optionDetails.type;
+            strike = tr.optionDetails.strike;
+            expiry = tr.optionDetails.expiry;
+          }
+        }
 
-      const status: 'OPEN' | 'CLOSED' | 'EXPIRED' | 'ASSIGNED' = isClosed ? 'CLOSED' : 'OPEN';
+        const bucket: BucketType =
+          linkedCount > 0 && standaloneCount === 0
+            ? 'LINKED'
+            : standaloneCount > 0 && linkedCount === 0
+            ? 'STANDALONE'
+            : trades[0]?.bucket || 'LINKED';
 
-      if (!isClosed) {
-        openOptionCountForTicker += 1;
-        openOptionsMvInStockCur += marketValue * optToStockFx;
-        openOptionsMvBase += marketValue * optFxToBase;
-        openOptionsUnrealizedInStockCur += unrealizedPnl * optToStockFx;
-        openOptionsUnrealizedBase += unrealizedPnl * optFxToBase;
+        if (Math.abs(netContracts) < 1e-6) netContracts = 0;
+        const isClosed = netContracts === 0;
+
+        // Closed option realized P&L is always exact cumulative cash inflow minus outflow (handles IBKR expired options where fifoPnlRealized=0)
+        const realizedPnl = isClosed ? netCashFlow : hasIbkrRealized ? ibkrRealizedSum : 0;
+
+        const optMark = !isClosed ? positionMarks[contractSymbol] : undefined;
+        // Open cost basis (signed: positive for Long debit, negative for Short credit)
+        const openCostBasis = isClosed
+          ? 0
+          : optMark && optMark.costBasisMoney !== 0
+          ? optMark.costBasisMoney
+          : -(netCashFlow - realizedPnl);
+
+        const avgEntryPerShare =
+          !isClosed && Math.abs(netContracts) > 0
+            ? Math.abs(openCostBasis) / (Math.abs(netContracts) * multiplier)
+            : 0;
+
+        const currentMarkPrice = isClosed ? 0 : optMark?.markPrice ?? avgEntryPerShare;
+        const marketValue = isClosed ? 0 : netContracts * currentMarkPrice * multiplier;
+        const unrealizedPnl = isClosed
+          ? 0
+          : optMark
+          ? optMark.fifoPnlUnrealized
+          : marketValue - openCostBasis;
+
+        const status: 'OPEN' | 'CLOSED' | 'EXPIRED' | 'ASSIGNED' = isClosed ? 'CLOSED' : 'OPEN';
+
+        if (!isClosed) {
+          openOptionCountForTicker += 1;
+          openOptionsMvInStockCur += marketValue * optToStockFx;
+          openOptionsMvBase += marketValue * optFxToBase;
+          openOptionsUnrealizedInStockCur += unrealizedPnl * optToStockFx;
+          openOptionsUnrealizedBase += unrealizedPnl * optFxToBase;
+
+          if (bucket === 'LINKED') {
+            totalOpenLinkedOptionsValue += marketValue * optFxToBase;
+          }
+
+          // Collateral for Short Puts
+          if (optType === 'PUT' && netContracts < 0) {
+            shortPutCollateralBase += strike * multiplier * Math.abs(netContracts) * optFxToBase;
+          }
+        }
+
+        realizedOptionsInStockCur += realizedPnl * optToStockFx;
+        realizedOptionsBase += realizedPnl * optFxToBase;
+
+        const campaign: OptionCampaign = {
+          id: stableCampaignId,
+          underlying: ticker,
+          contractSymbol,
+          type: optType,
+          strike,
+          expiry,
+          multiplier,
+          currency: optCurrency,
+          bucket,
+          trades,
+          netContracts,
+          totalCredits,
+          totalDebits,
+          netCashFlow,
+          realizedPnl,
+          openCostBasis,
+          currentMarkPrice: isClosed ? undefined : currentMarkPrice,
+          marketValue,
+          unrealizedPnl,
+          status,
+          isCurrentCoveredCall: netContracts < 0 && optType === 'CALL',
+        };
 
         if (bucket === 'LINKED') {
-          totalOpenLinkedOptionsValue += marketValue * optFxToBase;
+          linkedCampaigns.push(campaign);
+        } else {
+          standaloneCampaigns.push(campaign);
         }
-
-        // Collateral for Short Puts
-        if (optType === 'PUT' && netContracts < 0) {
-          shortPutCollateralBase += strike * multiplier * Math.abs(netContracts) * optFxToBase;
-        }
-      }
-
-      realizedOptionsInStockCur += realizedPnl * optToStockFx;
-      realizedOptionsBase += realizedPnl * optFxToBase;
-
-      const campaign: OptionCampaign = {
-        id: `camp-${contractSymbol}-${bucket}`,
-        underlying: ticker,
-        contractSymbol,
-        type: optType,
-        strike,
-        expiry,
-        multiplier,
-        currency: optCurrency,
-        bucket,
-        trades,
-        netContracts,
-        totalCredits,
-        totalDebits,
-        netCashFlow,
-        realizedPnl,
-        openCostBasis,
-        currentMarkPrice: isClosed ? undefined : currentMarkPrice,
-        marketValue,
-        unrealizedPnl,
-        status,
-        isCurrentCoveredCall: netContracts < 0 && optType === 'CALL',
-      };
-
-      if (bucket === 'LINKED') {
-        linkedCampaigns.push(campaign);
-      } else {
-        standaloneCampaigns.push(campaign);
-      }
 
       // Build CampaignComparisonItem
       const openingAction = trades[0]?.action || (netContracts < 0 ? 'SELL' : 'BUY');
@@ -746,35 +786,37 @@ export function calculatePortfolioState(
         optFxToBase
       );
 
-      comparisonItems.push({
-        id: campaign.id,
-        kind: 'OPTION_CAMPAIGN',
-        contractSymbol,
-        title: `${expiry ? expiry.slice(2).replace(/-/g, '') : ''} ${optCurrency === 'EUR' ? '€' : '$'}${strike} ${optType === 'CALL' ? 'C' : 'P'}`.trim(),
-        strategyType,
-        bucket,
-        canToggleBucket: true,
-        transactionIds: trades.map((t) => t.id),
-        status: isClosed ? 'CLOSED' : 'OPEN',
-        dte,
-        expiry,
-        strike,
-        optionType: optType,
-        netContracts,
-        strikeCushionPct: strikeCushionPct !== undefined ? Number(strikeCushionPct.toFixed(1)) : undefined,
-        currency: optCurrency,
-        capitalDeployedNative: campaignCapNative,
-        capitalDeployedBase: campCapBase,
-        netCashNative: netCashFlow,
-        realizedPnlNative: realizedPnl,
-        unrealizedPnlNative: unrealizedPnl,
-        netPnlNative: campTotalNetNative,
-        netPnlBase: campTotalNetBase,
-        tradeRoiPct: Number(campRoiPct.toFixed(1)),
-        annualizedReturnPct: campRet.annualizedReturnPct,
-        holdingDays: campRet.holdingDays,
-        trades,
-      });
+        comparisonItems.push({
+          id: campaign.id,
+          kind: 'OPTION_CAMPAIGN',
+          contractSymbol,
+          title: `${expiry ? expiry.slice(2).replace(/-/g, '') : ''} ${optCurrency === 'EUR' ? '€' : '$'}${strike} ${optType === 'CALL' ? 'C' : 'P'}`.trim(),
+          strategyType,
+          bucket,
+          canToggleBucket: true,
+          transactionIds: trades.map((t) => t.id),
+          status: isClosed ? 'CLOSED' : 'OPEN',
+          dte,
+          expiry,
+          strike,
+          optionType: optType,
+          netContracts,
+          strikeCushionPct: strikeCushionPct !== undefined ? Number(strikeCushionPct.toFixed(1)) : undefined,
+          currency: optCurrency,
+          capitalDeployedNative: campaignCapNative,
+          capitalDeployedBase: campCapBase,
+          netCashNative: netCashFlow,
+          realizedPnlNative: realizedPnl,
+          unrealizedPnlNative: unrealizedPnl,
+          netPnlNative: campTotalNetNative,
+          netPnlBase: campTotalNetBase,
+          tradeRoiPct: Number(campRoiPct.toFixed(1)),
+          annualizedReturnPct: campRet.annualizedReturnPct,
+          holdingDays: campRet.holdingDays,
+          trades,
+          legacyIds,
+        });
+      }
     }
 
     // Equity calculations
@@ -853,48 +895,174 @@ export function calculatePortfolioState(
       closedPositions.push(position);
     }
 
-    // Add Stock Lots + Dividends rows into CampaignComparisonItem list
+    // Add Stock Lots (split into flat-to-flat cycles with stable stk::TICKER::entryDate IDs) into CampaignComparisonItem list
     if (stkTrades.length > 0) {
-      const stockCapNative = currentShares > 0 ? runningRawCostPool : peakStockCostNative || totalStockGrossBuyNative;
-      const stockCapBase = stockCapNative * tickerFxToBase;
-      const stockOpenPnlNative = currentShares > 0 ? unrealizedPnlRaw : 0;
-      const stockTotalNetNative = stockOpenPnlNative + tickerRealizedStockPnl;
-      const stockTotalNetBase = stockOpenPnlNative * tickerFxToBase + tickerRealizedStockPnlBase;
-      const stockRoiPct = stockCapBase > 0 ? (stockTotalNetBase / stockCapBase) * 100 : 0;
-      const stockRet = computeSafeAnnualizedReturn(
-        stkTrades,
-        marketValue * tickerFxToBase,
-        stockCapBase,
-        stockTotalNetBase,
-        currentShares > 0,
-        baseCurrency,
-        fxRates,
-        tickerFxToBase
+      interface RawStockCycle {
+        startDate: string;
+        trades: Transaction[];
+        shares: number;
+        rawPool: number;
+        peakCost: number;
+        grossBuy: number;
+        realizedPnl: number;
+        realizedPnlBase: number;
+        isOpen: boolean;
+      }
+
+      const stockCycles: RawStockCycle[] = [];
+      let activeCycle: RawStockCycle | null = null;
+      const stkAndSplitTxs = sorted.filter(
+        (t) => t.assetCategory === 'STK' || (t.assetCategory === 'CORP_ACTION' && t.action === 'SPLIT')
       );
 
-      comparisonItems.unshift({
-        id: `camp-stk-${ticker}`,
-        kind: 'STOCK_LOT',
-        contractSymbol: `${ticker} EQUITY`,
-        title: currentShares > 0 ? `${currentShares.toLocaleString()} Shares Held` : `Closed Equity Lots`,
-        strategyType: 'Equity Core',
-        bucket: 'LINKED',
-        canToggleBucket: false,
-        transactionIds: stkTrades.map((t) => t.id),
-        status: currentShares > 0 ? 'OPEN' : 'CLOSED',
-        currency: primaryCurrency,
-        capitalDeployedNative: stockCapNative,
-        capitalDeployedBase: stockCapBase,
-        netCashNative: stkTrades.reduce((s, t) => s + t.netCashFlow, 0),
-        realizedPnlNative: tickerRealizedStockPnl,
-        unrealizedPnlNative: stockOpenPnlNative,
-        netPnlNative: stockTotalNetNative,
-        netPnlBase: stockTotalNetBase,
-        tradeRoiPct: Number(stockRoiPct.toFixed(1)),
-        annualizedReturnPct: stockRet.annualizedReturnPct,
-        holdingDays: stockRet.holdingDays,
-        trades: stkTrades,
+      for (const tx of stkAndSplitTxs) {
+        if (tx.assetCategory === 'CORP_ACTION' && tx.action === 'SPLIT') {
+          const ratio = tx.corporateAction?.ratio || tx.quantity || 1;
+          if (activeCycle && ratio > 0 && activeCycle.shares > 0) {
+            activeCycle.shares *= ratio;
+            activeCycle.trades.push(tx);
+          }
+          continue;
+        }
+
+        const qty = tx.quantity;
+        const price = tx.price;
+        const comm = Math.abs(tx.commission || 0);
+
+        if (qty > 0) {
+          if (!activeCycle) {
+            activeCycle = {
+              startDate: tx.date || tx.dateTime?.slice(0, 10) || 'unknown',
+              trades: [],
+              shares: 0,
+              rawPool: 0,
+              peakCost: 0,
+              grossBuy: 0,
+              realizedPnl: 0,
+              realizedPnlBase: 0,
+              isOpen: true,
+            };
+          }
+          const buyCost = tx.netCashFlow < 0 ? Math.abs(tx.netCashFlow) : qty * price + comm;
+          activeCycle.rawPool += buyCost;
+          activeCycle.shares += qty;
+          activeCycle.grossBuy += buyCost;
+          if (activeCycle.rawPool > activeCycle.peakCost) activeCycle.peakCost = activeCycle.rawPool;
+          activeCycle.trades.push(tx);
+        } else if (qty < 0) {
+          if (!activeCycle) {
+            // Standalone sell without prior buy record in history
+            activeCycle = {
+              startDate: tx.date || tx.dateTime?.slice(0, 10) || 'unknown',
+              trades: [tx],
+              shares: 0,
+              rawPool: 0,
+              peakCost: 0,
+              grossBuy: 0,
+              realizedPnl: tx.realizedPnl || 0,
+              realizedPnlBase: (tx.realizedPnl || 0) * tickerFxToBase,
+              isOpen: false,
+            };
+            stockCycles.push(activeCycle);
+            activeCycle = null;
+            continue;
+          }
+          const soldQty = Math.abs(qty);
+          const proceeds = tx.netCashFlow > 0 ? tx.netCashFlow : soldQty * price - comm;
+          activeCycle.trades.push(tx);
+          if (activeCycle.shares > 0) {
+            const ratio = Math.min(1.0, soldQty / activeCycle.shares);
+            const rawCostOfSold = activeCycle.rawPool * ratio;
+            const realizedTradePnl = proceeds - rawCostOfSold;
+            activeCycle.realizedPnl += realizedTradePnl;
+            activeCycle.realizedPnlBase += realizedTradePnl * tickerFxToBase;
+            activeCycle.rawPool = Math.max(0, activeCycle.rawPool * (1 - ratio));
+            activeCycle.shares = Math.max(0, activeCycle.shares - soldQty);
+          }
+          if (activeCycle.shares <= 1e-6) {
+            activeCycle.shares = 0;
+            activeCycle.rawPool = 0;
+            activeCycle.isOpen = false;
+            stockCycles.push(activeCycle);
+            activeCycle = null;
+          }
+        }
+      }
+
+      if (activeCycle) {
+        activeCycle.isOpen = activeCycle.shares > 1e-6;
+        stockCycles.push(activeCycle);
+      }
+
+      const stkDateCounts = new Map<string, number>();
+      const stockComparisonRows: CampaignComparisonItem[] = [];
+
+      stockCycles.forEach((cyc, idx) => {
+        const seq = (stkDateCounts.get(cyc.startDate) || 0) + 1;
+        stkDateCounts.set(cyc.startDate, seq);
+        const stableId =
+          seq > 1 ? `stk::${ticker}::${cyc.startDate}::${seq}` : `stk::${ticker}::${cyc.startDate}`;
+        const legacyIds = idx === 0 ? [`camp-stk-${ticker}`] : undefined;
+
+        const cycCapNative = cyc.isOpen ? cyc.rawPool : cyc.peakCost || cyc.grossBuy;
+        const cycCapBase = cycCapNative * tickerFxToBase;
+        const cycMvNative = cyc.isOpen ? cyc.shares * spotPrice : 0;
+        const cycOpenPnlNative = cyc.isOpen ? cycMvNative - cyc.rawPool : 0;
+        const cycTotalNetNative = cycOpenPnlNative + cyc.realizedPnl;
+        const cycTotalNetBase = cycOpenPnlNative * tickerFxToBase + cyc.realizedPnlBase;
+        const cycRoiPct = cycCapBase > 0 ? (cycTotalNetBase / cycCapBase) * 100 : 0;
+        const cycRet = computeSafeAnnualizedReturn(
+          cyc.trades,
+          cycMvNative * tickerFxToBase,
+          cycCapBase,
+          cycTotalNetBase,
+          cyc.isOpen,
+          baseCurrency,
+          fxRates,
+          tickerFxToBase
+        );
+
+        const title =
+          stockCycles.length === 1
+            ? cyc.isOpen
+              ? `${cyc.shares.toLocaleString()} Shares Held`
+              : `Closed Equity Lots`
+            : cyc.isOpen
+            ? `Cycle #${idx + 1} • ${cyc.shares.toLocaleString()} Shs`
+            : `Cycle #${idx + 1} • Closed (${cyc.startDate})`;
+
+        stockComparisonRows.push({
+          id: stableId,
+          kind: 'STOCK_LOT',
+          contractSymbol: `${ticker} EQUITY`,
+          title,
+          strategyType: 'Equity Core',
+          bucket: 'LINKED',
+          canToggleBucket: false,
+          transactionIds: cyc.trades.map((t) => t.id),
+          status: cyc.isOpen ? 'OPEN' : 'CLOSED',
+          currency: primaryCurrency,
+          capitalDeployedNative: cycCapNative,
+          capitalDeployedBase: cycCapBase,
+          netCashNative: cyc.trades.reduce((s, t) => s + t.netCashFlow, 0),
+          realizedPnlNative: cyc.realizedPnl,
+          unrealizedPnlNative: cycOpenPnlNative,
+          netPnlNative: cycTotalNetNative,
+          netPnlBase: cycTotalNetBase,
+          tradeRoiPct: Number(cycRoiPct.toFixed(1)),
+          annualizedReturnPct: cycRet.annualizedReturnPct,
+          holdingDays: cycRet.holdingDays,
+          trades: cyc.trades,
+          legacyIds,
+        });
       });
+
+      // Put open stock cycles first, then closed cycles newest-first, prepended before option campaigns
+      stockComparisonRows.sort((a, b) => {
+        if (a.status !== b.status) return a.status === 'OPEN' ? -1 : 1;
+        return b.id.localeCompare(a.id);
+      });
+      comparisonItems.unshift(...stockComparisonRows);
     }
 
     const divTxs = sorted.filter((t) => t.assetCategory === 'DIV' || t.assetCategory === 'TAX');

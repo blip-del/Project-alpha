@@ -11,6 +11,7 @@ import {
   Coins,
   History,
   Upload,
+  BookOpen,
 } from 'lucide-react';
 import {
   UnifiedTickerSummary,
@@ -203,6 +204,20 @@ export const UnifiedTickerMatrix: React.FC<UnifiedTickerMatrixProps> = ({
             <span className={`w-2 h-2 rounded-sm ${panels.expiryMatrix ? 'bg-purple-400' : 'border border-slate-500'}`} />
             <Clock className="w-3.5 h-3.5" />
             <span>Open Expiry &amp; Theta Matrix</span>
+          </button>
+
+          <button
+            onClick={() => togglePanel('filteredJournal')}
+            aria-pressed={panels.filteredJournal}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border transition-all ${
+              panels.filteredJournal
+                ? 'bg-amber-500/15 border-amber-500/50 text-amber-300 font-bold'
+                : 'bg-[#080d14] border-[#1a283a] text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <span className={`w-2 h-2 rounded-sm ${panels.filteredJournal ? 'bg-amber-400' : 'border border-slate-500'}`} />
+            <BookOpen className="w-3.5 h-3.5" />
+            <span>Filtered Journal</span>
           </button>
         </div>
       </div>

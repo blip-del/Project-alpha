@@ -11,6 +11,9 @@ import {
   StockQuote,
   PositionMark,
   OptionalPanelsState,
+  UnifiedTickerSummary,
+  JournalTradeOverride,
+  JournalSettings,
 } from '../types';
 import {
   computeStepDownData,
@@ -18,6 +21,7 @@ import {
   computeActiveOptions,
   StepDownPoint,
 } from '../utils/analyticsEngine';
+import { FilteredJournalPanel } from './FilteredJournalPanel';
 import {
   ResponsiveContainer,
   LineChart,
@@ -35,11 +39,21 @@ interface OptionalDeepDivePanelsProps {
   positions: StockPosition[];
   closedPositions?: StockPosition[];
   standalonePositions: StandaloneOptionPosition[];
+  unifiedTickers: UnifiedTickerSummary[];
   transactions: Transaction[];
   quotes: Record<string, StockQuote>;
+  quotesFetchedAt?: string;
   fxRates: Record<string, number>;
   positionMarks: Record<string, PositionMark>;
   baseCurrency: 'EUR' | 'USD';
+  netLiqValueBase: number;
+  onRefreshQuotes: () => Promise<void> | void;
+  journalOverrides: Record<string, JournalTradeOverride>;
+  onChangeJournalOverrides: React.Dispatch<React.SetStateAction<Record<string, JournalTradeOverride>>>;
+  journalSettings: JournalSettings;
+  onChangeJournalSettings: React.Dispatch<React.SetStateAction<JournalSettings>>;
+  focusClosedTradeId?: string | null;
+  onClearFocusTrade?: () => void;
 }
 
 export const OptionalDeepDivePanels: React.FC<OptionalDeepDivePanelsProps> = ({
@@ -47,11 +61,21 @@ export const OptionalDeepDivePanels: React.FC<OptionalDeepDivePanelsProps> = ({
   positions,
   closedPositions = [],
   standalonePositions,
+  unifiedTickers,
   transactions,
   quotes,
+  quotesFetchedAt,
   fxRates,
   positionMarks,
   baseCurrency,
+  netLiqValueBase,
+  onRefreshQuotes,
+  journalOverrides,
+  onChangeJournalOverrides,
+  journalSettings,
+  onChangeJournalSettings,
+  focusClosedTradeId,
+  onClearFocusTrade,
 }) => {
   const availableTickers = useMemo(() => positions.map((p) => p.ticker), [positions]);
   const [selectedTicker, setSelectedTicker] = useState<string>(availableTickers[0] || '');
@@ -77,7 +101,7 @@ export const OptionalDeepDivePanels: React.FC<OptionalDeepDivePanelsProps> = ({
     return computeActiveOptions(positions, standalonePositions, quotes, positionMarks, baseCurrency, fxRates, closedPositions);
   }, [panels.expiryMatrix, positions, closedPositions, standalonePositions, quotes, positionMarks, baseCurrency, fxRates]);
 
-  if (!panels.stepDown && !panels.monthlyCashflow && !panels.expiryMatrix) {
+  if (!panels.stepDown && !panels.monthlyCashflow && !panels.expiryMatrix && !panels.filteredJournal) {
     return null;
   }
 
@@ -342,6 +366,26 @@ export const OptionalDeepDivePanels: React.FC<OptionalDeepDivePanelsProps> = ({
             </div>
           )}
         </div>
+      )}
+
+      {/* 4. FILTERED JOURNAL DEEP-DIVE PANEL */}
+      {panels.filteredJournal && (
+        <FilteredJournalPanel
+          unifiedTickers={unifiedTickers}
+          quotes={quotes}
+          quotesFetchedAt={quotesFetchedAt}
+          positionMarks={positionMarks}
+          fxRates={fxRates}
+          baseCurrency={baseCurrency}
+          netLiqValueBase={netLiqValueBase}
+          onRefreshQuotes={onRefreshQuotes}
+          overrides={journalOverrides}
+          onChangeOverrides={onChangeJournalOverrides}
+          settings={journalSettings}
+          onChangeSettings={onChangeJournalSettings}
+          focusClosedTradeId={focusClosedTradeId}
+          onClearFocusTrade={onClearFocusTrade}
+        />
       )}
     </div>
   );

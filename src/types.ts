@@ -204,6 +204,7 @@ export interface CampaignComparisonItem {
   annualizedReturnPct: number | null;
   holdingDays: number;
   trades: Transaction[];
+  legacyIds?: string[]; // Previous unstable IDs (e.g. camp-stk-TICKER or camp-SYM-LINKED) for lossless override migration
 }
 
 export interface UnifiedTickerSummary {
@@ -333,13 +334,243 @@ export interface OptionalPanelsState {
   stepDown: boolean;
   monthlyCashflow: boolean;
   expiryMatrix: boolean;
+  filteredJournal: boolean;
 }
 
 export const DEFAULT_OPTIONAL_PANELS: OptionalPanelsState = {
   stepDown: false,
   monthlyCashflow: false,
   expiryMatrix: false,
+  filteredJournal: false,
 };
+
+// ------------------------------------------------------------
+// FILTERED JOURNAL DEEP-DIVE TYPES
+// ------------------------------------------------------------
+
+export type JournalSignalColor = 'RED' | 'AMBER' | 'GREEN' | 'GREY';
+
+export type JournalCatalystType =
+  | 'Earnings'
+  | 'Clinical / FDA'
+  | 'Insider Cluster'
+  | 'Activist / 13D'
+  | 'M&A / Spin-off'
+  | 'Product / Contract'
+  | 'Macro / Technical'
+  | 'Other';
+
+export type JournalExitReason =
+  | 'stop'
+  | 'target'
+  | 'thesis_broke'
+  | 'gap'
+  | 'expiry';
+
+export interface SecForm4Summary {
+  insiderName: string;
+  insiderRole: string;
+  transactionCode: string;
+  actionLabel: string;
+  shares: number;
+  pricePerShare: number;
+  totalValue: number;
+  isOpenMarketBuy: boolean;
+  isOpenMarketSale: boolean;
+  isRoutineNoise: boolean;
+}
+
+export interface SecFilingItem {
+  form: string;
+  filingDate: string;
+  reportDate?: string;
+  accessionNumber: string;
+  description: string;
+  secUrl: string;
+  isTriggerForm: boolean;
+  form4Summary?: SecForm4Summary;
+}
+
+export interface SecTickerFilings {
+  ticker: string;
+  cik?: string;
+  companyName?: string;
+  status: 'OK' | 'NO_CIK' | 'ERROR';
+  error?: string;
+  fetchedAt: string;
+  source: string;
+  filings: SecFilingItem[];
+}
+
+export interface JournalLoggedFields {
+  insiderCluster?: boolean;
+  preCatalystEntry?: boolean;
+  asymmetricRR?: boolean;
+  volumeConfirmed?: boolean;
+  sectorTailwind?: boolean;
+}
+
+export interface JournalTradeOverride {
+  riskPerTrade?: number; // Fixed 1R in position native currency (default 100)
+  thesis?: string;
+  stopPrice?: number;
+  target1?: number;
+  target2?: number;
+  target3?: number;
+  catalystType?: JournalCatalystType;
+  catalystDate?: string; // YYYY-MM-DD
+  thesisBroken?: boolean;
+  lastViewedAt?: string; // ISO timestamp for detecting new filings since last view
+  manualPriceOverride?: number;
+  manualPriceTimestamp?: string;
+  manualFilingNote?: string;
+  exitReason?: JournalExitReason;
+  lesson?: string;
+  loggedFields?: JournalLoggedFields;
+}
+
+export interface JournalSavedView {
+  id: string;
+  name: string;
+  builtIn?: boolean;
+  instrument: 'ALL' | 'STOCK' | 'OPTION';
+  statusChip: 'OPEN' | 'ATTENTION' | 'CLOSED';
+  catalystFilter: string;
+  ageFilter: 'ALL' | 'LT14' | 'D14_60' | 'GT60';
+  expiringThisMonth?: boolean;
+  insiderClusterOnly?: boolean;
+}
+
+export interface JournalSettings {
+  defaultRisk1R: number; // Default 100
+  sleeveCapPct: number; // Configurable portfolio open-risk sleeve cap % (default 10)
+  autoRefreshMinutes: number; // Default 15
+  savedViews: JournalSavedView[];
+}
+
+export const DEFAULT_JOURNAL_SAVED_VIEWS: JournalSavedView[] = [
+  {
+    id: 'view-opt-month',
+    name: 'Options expiring this month',
+    builtIn: true,
+    instrument: 'OPTION',
+    statusChip: 'OPEN',
+    catalystFilter: 'ALL',
+    ageFilter: 'ALL',
+    expiringThisMonth: true,
+  },
+  {
+    id: 'view-insider-cluster',
+    name: 'Insider-cluster trades',
+    builtIn: true,
+    instrument: 'ALL',
+    statusChip: 'OPEN',
+    catalystFilter: 'ALL',
+    ageFilter: 'ALL',
+    insiderClusterOnly: true,
+  },
+];
+
+export const DEFAULT_JOURNAL_SETTINGS: JournalSettings = {
+  defaultRisk1R: 100,
+  sleeveCapPct: 10,
+  autoRefreshMinutes: 15,
+  savedViews: DEFAULT_JOURNAL_SAVED_VIEWS,
+};
+
+export interface JournalSignalReason {
+  level: JournalSignalColor;
+  code: string;
+  detail: string;
+  source: string;
+  timestamp?: string;
+}
+
+export interface JournalDerivedTrade {
+  id: string; // matches CampaignComparisonItem.id
+  ticker: string;
+  companyName: string;
+  contractSymbol: string;
+  instrument: 'STOCK' | 'OPTION';
+  displayType: string; // e.g., "Stock", "Long Call", "Short Call", "Long Put"
+  optionType?: 'CALL' | 'PUT';
+  isShortOption?: boolean;
+  status: 'OPEN' | 'CLOSED';
+  currency: string;
+  fxToBase: number;
+
+  // Dates & age
+  entryDate: string;
+  exitDate?: string;
+  holdingDays: number;
+  dte?: number;
+  expiry?: string;
+  catalystType: JournalCatalystType;
+  catalystDate?: string;
+  nextEventDate?: string; // nearest of catalystDate or expiry
+  daysToNextEvent?: number;
+
+  // Quantity, prices & provenance
+  quantity: number; // shares or contracts
+  multiplier: number;
+  entryPrice: number; // per share or per option contract share
+  realEntryPrice?: number;
+  currentPrice: number;
+  priceSource: 'Yahoo Finance' | 'IBKR XML Mark' | 'Manual Override' | 'Missing';
+  priceTimestamp?: string;
+  priceIsStale: boolean;
+
+  // Fixed 1R Risk & Sizing
+  risk1RNative: number;
+  risk1RBase: number;
+  plannedSizeUnits?: number; // Stocks: floor(1R / |entry - stop|); Options: floor(1R / (entry*mult))
+  openRiskNative: number;
+  openRiskBase: number;
+
+  // Stock Range Bar levels
+  stopPrice?: number;
+  target1?: number;
+  target2?: number;
+  target3?: number;
+  stopDistancePct?: number; // % of entry-to-stop cushion remaining
+
+  // Option-specific metrics
+  strike?: number;
+  premiumPaidNative?: number;
+  currentOptionValueNative?: number;
+  premiumChangePct?: number; // (currentValue - premiumPaid) / premiumPaid * 100
+  breakevenPrice?: number;
+  spotPrice?: number;
+  breakevenDiffPct?: number; // how far current spot is from breakeven
+
+  // Results in currency & R
+  pnlNative: number;
+  pnlBase: number;
+  currentR: number;
+  plannedLossR: number; // -1.0R
+  actualLossR?: number; // negative R on losing closed trades
+
+  // Qualitative / Journal fields
+  thesis: string;
+  thesisBroken: boolean;
+  exitReason?: JournalExitReason;
+  lesson?: string;
+  loggedFields: JournalLoggedFields;
+  hasInsiderCluster: boolean;
+
+  // SEC Filings
+  secFilings: SecFilingItem[];
+  newTriggerFilings: SecFilingItem[];
+  secStatus: 'OK' | 'NO_CIK' | 'ERROR' | 'IDLE';
+  secFetchedAt?: string;
+  lastViewedAt?: string;
+  manualFilingNote?: string;
+
+  // Signal system (only color system: 4 states)
+  signalColor: JournalSignalColor;
+  signalPriority: number; // 0=RED, 1=AMBER, 2=GREEN, 3=GREY
+  signalReasons: JournalSignalReason[];
+}
 
 export interface ViewVisibilityState {
   // Overview KPIs
@@ -422,3 +653,147 @@ export interface StockQuote {
   marketCap?: number;
   exchange?: string;
 }
+
+// ------------------------------------------------------------
+// SAFE INCREMENTAL XML IMPORT & SNAPSHOT GUARD TYPES
+// ------------------------------------------------------------
+
+export interface CashTransferEvent {
+  id: string; // IBKR transactionID or deterministic hash
+  date: string; // YYYY-MM-DD
+  amountBase: number; // positive = deposit, negative = withdrawal
+  currency: string;
+  description?: string;
+}
+
+export interface StatementSnapshotMeta {
+  fromDate?: string; // YYYY-MM-DD from <FlexStatement fromDate>
+  toDate?: string; // YYYY-MM-DD from <FlexStatement toDate>
+  whenGenerated?: string; // Raw or normalized timestamp from <FlexStatement whenGenerated>
+  importedAt: string; // ISO timestamp when merged into app
+  sourceLabel?: string; // filename or "Pasted Data"
+  format: 'XML' | 'CSV' | 'JSON';
+  isFullHistory?: boolean;
+  knownCashTransferIds?: string[]; // Dedup set for incremental CashTransaction deposit/withdrawal deltas
+}
+
+export interface ImportNewlyClosedTrade {
+  id: string;
+  ticker: string;
+  title: string;
+  instrument: 'STOCK' | 'OPTION';
+  needsLesson: boolean;
+}
+
+export interface ImportMergeDiff {
+  sourceLabel: string;
+  format: 'XML' | 'CSV' | 'JSON';
+  statementFromDate?: string;
+  statementToDate?: string;
+  newTransactionsCount: number;
+  duplicatesSkipped: number;
+  enrichedUpdatedCount: number;
+  crossSourceDividendsSkipped: number;
+  snapshotUpdated: boolean;
+  snapshotGuardReason?: string;
+  depositsPreservedReason?: string;
+  newlyClosedTrades: ImportNewlyClosedTrade[];
+  newlyOpenedTradesCount: number;
+  staleManualPricesCleared: number;
+  manualOverridesPreserved: number;
+  migratedOverridesCount: number;
+  sectionsFound: string[];
+}
+
+export interface ImportUndoSnapshot {
+  createdAt: string;
+  sourceLabel: string;
+  transactions: Transaction[];
+  fxRates: Record<string, number>;
+  positionMarks: Record<string, PositionMark>;
+  endingCashBase?: number;
+  endingCashCurrency: 'EUR' | 'USD';
+  depositsBase?: number;
+  withdrawalsBase?: number;
+  netDepositsBase?: number;
+  cashByCurrency?: Record<string, number>;
+  bucketOverrides: Record<string, BucketType>;
+  journalOverrides: Record<string, JournalTradeOverride>;
+  lastStatementMeta?: StatementSnapshotMeta;
+}
+
+// ------------------------------------------------------------
+// AI FILING & NEWS INTELLIGENCE + POST-MORTEM REVIEW TYPES
+// ------------------------------------------------------------
+
+export interface JournalIntelSource {
+  title: string;
+  url: string;
+}
+
+export interface JournalFilingDigest {
+  form: string;
+  date: string;
+  materiality: 'MATERIAL' | 'DILUTION' | 'INSIDER_BUY' | 'ROUTINE';
+  headline: string;
+  summary: string;
+  secUrl?: string;
+}
+
+export interface JournalThesisCheck {
+  verdict: 'ALIGNED' | 'WATCH' | 'RISK' | 'NO_THESIS';
+  summary: string;
+  evidence: string;
+  sourceUrl?: string;
+}
+
+export interface JournalCatalystRadar {
+  suggestedCatalystType?: JournalCatalystType;
+  suggestedDate?: string; // YYYY-MM-DD
+  eventLabel: string;
+  timelineDrift: 'ON_TRACK' | 'DELAYED' | 'PULLED_FORWARD' | 'UNKNOWN';
+  driftNote?: string;
+  sourceUrl?: string;
+}
+
+export interface JournalRunwayDilution {
+  cashAndEquivalents?: string;
+  quarterlyBurn?: string;
+  estimatedRunwayMonths?: number | null;
+  dilutionRisk: 'LOW' | 'MODERATE' | 'HIGH' | 'UNKNOWN';
+  atmOrShelfNote: string;
+  asOfDate?: string;
+}
+
+export interface JournalExitContext {
+  summary: string;
+  keyEvents: Array<{
+    date: string;
+    headline: string;
+    sourceUrl?: string;
+  }>;
+}
+
+export interface JournalTradeIntel {
+  ticker: string;
+  analyzedAt: string; // ISO timestamp
+  source: string; // e.g. "SEC EDGAR + Gemini Search Grounding"
+  thesisSnapshot?: string; // thesis at time of analysis
+  thesisCheck: JournalThesisCheck;
+  filingDigests: JournalFilingDigest[];
+  catalystRadar: JournalCatalystRadar;
+  runwayAndDilution: JournalRunwayDilution;
+  exitContext?: JournalExitContext;
+  sources: JournalIntelSource[];
+}
+
+export interface JournalPostMortemReview {
+  analyzedAt: string;
+  closedTradeCount: number;
+  executiveTakeaway: string;
+  workingEdges: string[];
+  recurringLeaks: string[];
+  nextTradeRules: string[];
+}
+
+

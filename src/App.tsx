@@ -12,12 +12,24 @@ import {
   BrokerCashSummary,
   OptionalPanelsState,
   DEFAULT_OPTIONAL_PANELS,
+  JournalTradeOverride,
+  JournalSettings,
+  DEFAULT_JOURNAL_SETTINGS,
+  DEFAULT_JOURNAL_SAVED_VIEWS,
+  StatementSnapshotMeta,
+  ImportMergeDiff,
+  ImportUndoSnapshot,
 } from './types';
 import {
   exportPortfolioToJson,
   importPortfolioFromJson,
 } from './utils/ibkrParser';
 import { calculatePortfolioState, getFxMultiplier } from './utils/portfolioEngine';
+import {
+  mergePortfolioImport,
+  migrateLegacyJournalOverrides,
+  ParsedImportPayload,
+} from './utils/xmlImportEngine';
 import { computeCapitalAllocation } from './utils/analyticsEngine';
 import { fetchPortfolioQuotes } from './services/optionsService';
 import { Header } from './components/Header';
@@ -151,7 +163,50 @@ export default function App() {
     }
   });
 
+  const [journalOverrides, setJournalOverrides] = useState<Record<string, JournalTradeOverride>>(() => {
+    try {
+      const saved = localStorage.getItem('ais_portfolio_journal_overrides_v1');
+      return saved ? JSON.parse(saved) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  const [journalSettings, setJournalSettings] = useState<JournalSettings>(() => {
+    try {
+      const saved = localStorage.getItem('ais_portfolio_journal_settings_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return {
+          ...DEFAULT_JOURNAL_SETTINGS,
+          ...parsed,
+          savedViews:
+            Array.isArray(parsed.savedViews) && parsed.savedViews.length > 0
+              ? parsed.savedViews
+              : DEFAULT_JOURNAL_SAVED_VIEWS,
+        };
+      }
+      return DEFAULT_JOURNAL_SETTINGS;
+    } catch {
+      return DEFAULT_JOURNAL_SETTINGS;
+    }
+  });
+
+  const [lastStatementMeta, setLastStatementMeta] = useState<StatementSnapshotMeta | undefined>(() => {
+    try {
+      const saved = localStorage.getItem('ais_portfolio_statement_meta_v1');
+      return saved ? JSON.parse(saved) : undefined;
+    } catch {
+      return undefined;
+    }
+  });
+
+  const [lastImportDiff, setLastImportDiff] = useState<ImportMergeDiff | null>(null);
+  const [lastImportUndo, setLastImportUndo] = useState<ImportUndoSnapshot | null>(null);
+  const [focusClosedTradeId, setFocusClosedTradeId] = useState<string | null>(null);
+
   const [quotes, setQuotes] = useState<Record<string, StockQuote>>({});
+  const [quotesFetchedAt, setQuotesFetchedAt] = useState<string | undefined>(undefined);
   const [isRefreshingQuotes, setIsRefreshingQuotes] = useState(false);
 
   useEffect(() => {
@@ -212,6 +267,34 @@ export default function App() {
       console.warn('Failed saving optional panels:', e);
     }
   }, [optionalPanels]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('ais_portfolio_journal_overrides_v1', JSON.stringify(journalOverrides));
+    } catch (e) {
+      console.warn('Failed saving journal overrides:', e);
+    }
+  }, [journalOverrides]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('ais_portfolio_journal_settings_v1', JSON.stringify(journalSettings));
+    } catch (e) {
+      console.warn('Failed saving journal settings:', e);
+    }
+  }, [journalSettings]);
+
+  useEffect(() => {
+    try {
+      if (lastStatementMeta) {
+        localStorage.setItem('ais_portfolio_statement_meta_v1', JSON.stringify(lastStatementMeta));
+      } else {
+        localStorage.removeItem('ais_portfolio_statement_meta_v1');
+      }
+    } catch (e) {
+      console.warn('Failed saving statement metadata:', e);
+    }
+  }, [lastStatementMeta]);
 
   // Fetch live market quotes with exchange-aware European suffix mapping
   const refreshQuotes = useCallback(async () => {
@@ -290,6 +373,7 @@ export default function App() {
         }
         if (Object.keys(mapped).length > 0) {
           setQuotes((prev) => ({ ...prev, ...mapped }));
+          setQuotesFetchedAt(new Date().toISOString());
         }
       }
     } catch (err) {
@@ -313,6 +397,19 @@ export default function App() {
       positionMarks
     );
   }, [transactions, bucketOverrides, quotes, baseCurrency, fxRates, positionMarks]);
+
+  // One-time lossless migration of any legacy journal keys (camp-stk-*, camp-*-LINKED) -> stable trade-cycle IDs
+  useEffect(() => {
+    if (portfolioState.unifiedTickers.length === 0) return;
+    if (Object.keys(journalOverrides).length === 0) return;
+    const { overrides: migrated, migratedCount } = migrateLegacyJournalOverrides(
+      journalOverrides,
+      portfolioState.unifiedTickers
+    );
+    if (migratedCount > 0) {
+      setJournalOverrides(migrated);
+    }
+  }, [portfolioState.unifiedTickers, journalOverrides]);
 
   const endingCashInDisplayCurrency = useMemo(() => {
     if (cashByCurrency && Object.keys(cashByCurrency).length > 0) {
@@ -405,54 +502,70 @@ export default function App() {
     setBaseCurrency((prev) => (prev === 'EUR' ? 'USD' : 'EUR'));
   };
 
-  const handleImportTransactions = (
-    newTransactions: Transaction[],
-    detectedBaseCurrency?: 'EUR' | 'USD',
-    meta?: {
-      fxRates?: Record<string, number>;
-      positionMarks?: Record<string, PositionMark>;
-      endingCashBase?: number;
-      depositsBase?: number;
-      withdrawalsBase?: number;
-      netDepositsBase?: number;
-      cashByCurrency?: Record<string, number>;
-    }
-  ) => {
-    setTransactions((prev) => {
-      const existingIds = new Set(prev.map((t) => t.id));
-      const fresh = newTransactions.filter((t) => !existingIds.has(t.id));
-      const merged = [...prev, ...fresh];
-      merged.sort((a, b) => (new Date(a.dateTime).getTime() || 0) - (new Date(b.dateTime).getTime() || 0));
-      return merged;
-    });
+  const handleMergeImport = (payload: ParsedImportPayload, sourceLabel: string): ImportMergeDiff => {
+    const result = mergePortfolioImport(
+      {
+        transactions,
+        fxRates,
+        positionMarks,
+        endingCashBase,
+        endingCashCurrency,
+        depositsBase,
+        withdrawalsBase,
+        netDepositsBase,
+        cashByCurrency,
+        bucketOverrides,
+        journalOverrides,
+        lastStatementMeta,
+        baseCurrency,
+        quotes,
+      },
+      payload,
+      sourceLabel
+    );
 
-    if (meta?.fxRates && Object.keys(meta.fxRates).length > 0) {
-      setFxRates((prev) => ({ ...prev, ...meta.fxRates }));
-    }
-    if (meta?.positionMarks && Object.keys(meta.positionMarks).length > 0) {
-      setPositionMarks(meta.positionMarks);
-    }
-    if (meta?.endingCashBase !== undefined) {
-      setEndingCashBase(meta.endingCashBase);
-      if (detectedBaseCurrency) setEndingCashCurrency(detectedBaseCurrency);
-    }
-    if (meta?.depositsBase !== undefined) {
-      setDepositsBase(meta.depositsBase);
-      if (detectedBaseCurrency) setEndingCashCurrency(detectedBaseCurrency);
-    }
-    if (meta?.withdrawalsBase !== undefined) {
-      setWithdrawalsBase(meta.withdrawalsBase);
-    }
-    if (meta?.netDepositsBase !== undefined) {
-      setNetDepositsBase(meta.netDepositsBase);
-      if (detectedBaseCurrency) setEndingCashCurrency(detectedBaseCurrency);
-    }
-    if (meta?.cashByCurrency && Object.keys(meta.cashByCurrency).length > 0) {
-      setCashByCurrency(meta.cashByCurrency);
-    }
-    if (detectedBaseCurrency) {
-      setBaseCurrency(detectedBaseCurrency);
-    }
+    const { nextState, diff, undoSnapshot } = result;
+    setTransactions(nextState.transactions);
+    setFxRates(nextState.fxRates);
+    setPositionMarks(nextState.positionMarks);
+    setEndingCashBase(nextState.endingCashBase);
+    setEndingCashCurrency(nextState.endingCashCurrency);
+    setDepositsBase(nextState.depositsBase);
+    setWithdrawalsBase(nextState.withdrawalsBase);
+    setNetDepositsBase(nextState.netDepositsBase);
+    setCashByCurrency(nextState.cashByCurrency);
+    setBucketOverrides(nextState.bucketOverrides);
+    setJournalOverrides(nextState.journalOverrides);
+    setLastStatementMeta(nextState.lastStatementMeta);
+    setBaseCurrency(nextState.baseCurrency);
+    setLastImportUndo(undoSnapshot);
+    setLastImportDiff(diff);
+
+    return diff;
+  };
+
+  const handleUndoLastImport = () => {
+    if (!lastImportUndo) return;
+    setTransactions(lastImportUndo.transactions);
+    setFxRates(lastImportUndo.fxRates);
+    setPositionMarks(lastImportUndo.positionMarks);
+    setEndingCashBase(lastImportUndo.endingCashBase);
+    setEndingCashCurrency(lastImportUndo.endingCashCurrency);
+    setDepositsBase(lastImportUndo.depositsBase);
+    setWithdrawalsBase(lastImportUndo.withdrawalsBase);
+    setNetDepositsBase(lastImportUndo.netDepositsBase);
+    setCashByCurrency(lastImportUndo.cashByCurrency);
+    setBucketOverrides(lastImportUndo.bucketOverrides);
+    setJournalOverrides(lastImportUndo.journalOverrides);
+    setLastStatementMeta(lastImportUndo.lastStatementMeta);
+    setLastImportUndo(null);
+    setLastImportDiff(null);
+  };
+
+  const handleOpenJournalClosedTrade = (tradeId: string) => {
+    setOptionalPanels((prev) => ({ ...prev, filteredJournal: true }));
+    setFocusClosedTradeId(tradeId);
+    setActiveTab('PORTFOLIO');
   };
 
   const handleClearPortfolio = () => {
@@ -465,17 +578,30 @@ export default function App() {
     setWithdrawalsBase(undefined);
     setNetDepositsBase(undefined);
     setCashByCurrency(undefined);
+    setLastStatementMeta(undefined);
+    setLastImportDiff(null);
+    setLastImportUndo(null);
     setQuotes({});
   };
 
   const handleExportJson = () => {
-    const jsonStr = exportPortfolioToJson(transactions, bucketOverrides, baseCurrency, {
-      endingCashBase: endingCashInDisplayCurrency,
-      depositsBase: cashSummaryInDisplayCurrency?.depositsBase,
-      withdrawalsBase: cashSummaryInDisplayCurrency?.withdrawalsBase,
-      netDepositsBase: cashSummaryInDisplayCurrency?.netDepositsBase,
-      cashByCurrency,
-    });
+    const jsonStr = exportPortfolioToJson(
+      transactions,
+      bucketOverrides,
+      baseCurrency,
+      {
+        endingCashBase: endingCashInDisplayCurrency,
+        depositsBase: cashSummaryInDisplayCurrency?.depositsBase,
+        withdrawalsBase: cashSummaryInDisplayCurrency?.withdrawalsBase,
+        netDepositsBase: cashSummaryInDisplayCurrency?.netDepositsBase,
+        cashByCurrency,
+      },
+      {
+        overrides: journalOverrides,
+        settings: journalSettings,
+      },
+      lastStatementMeta
+    );
     const blob = new Blob([jsonStr], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -507,6 +633,15 @@ export default function App() {
         setWithdrawalsBase(res.withdrawalsBase);
         setNetDepositsBase(res.netDepositsBase);
         setCashByCurrency(res.cashByCurrency);
+        setLastStatementMeta(res.lastStatementMeta);
+        setLastImportDiff(null);
+        setLastImportUndo(null);
+        if (res.journalBackup?.overrides) {
+          setJournalOverrides(res.journalBackup.overrides);
+        }
+        if (res.journalBackup?.settings) {
+          setJournalSettings({ ...DEFAULT_JOURNAL_SETTINGS, ...res.journalBackup.settings });
+        }
       } catch (err: any) {
         console.error('Failed reading file:', err.message);
       }
@@ -622,23 +757,43 @@ export default function App() {
               positions={portfolioState.positions}
               closedPositions={portfolioState.closedPositions}
               standalonePositions={portfolioState.standalonePositions}
+              unifiedTickers={portfolioState.unifiedTickers}
               transactions={transactions}
               quotes={quotes}
+              quotesFetchedAt={quotesFetchedAt}
               fxRates={fxRates}
               positionMarks={positionMarks}
               baseCurrency={baseCurrency}
+              netLiqValueBase={
+                portfolioState.summary.totalMarketValue +
+                (endingCashInDisplayCurrency ?? allocation.freeCashBuffer ?? 0)
+              }
+              onRefreshQuotes={refreshQuotes}
+              journalOverrides={journalOverrides}
+              onChangeJournalOverrides={setJournalOverrides}
+              journalSettings={journalSettings}
+              onChangeJournalSettings={setJournalSettings}
+              focusClosedTradeId={focusClosedTradeId}
+              onClearFocusTrade={() => setFocusClosedTradeId(null)}
             />
           </>
         ) : (
           <LedgerImportTab
             transactions={transactions}
-            onImportTransactions={handleImportTransactions}
+            onMergeImport={handleMergeImport}
             onClearPortfolio={handleClearPortfolio}
             onExportJson={handleExportJson}
             onImportJsonFile={handleImportJsonFile}
             bucketOverrides={bucketOverrides}
             onToggleBucket={handleToggleBucket}
             baseCurrency={baseCurrency}
+            lastStatementMeta={lastStatementMeta}
+            lastImportDiff={lastImportDiff}
+            onDismissImportDiff={() => setLastImportDiff(null)}
+            canUndoImport={Boolean(lastImportUndo)}
+            onUndoLastImport={handleUndoLastImport}
+            journalOverrideCount={Object.keys(journalOverrides).length}
+            onOpenJournalClosedTrade={handleOpenJournalClosedTrade}
           />
         )}
       </main>
